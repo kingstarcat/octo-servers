@@ -115,11 +115,15 @@ fn run(log: &Log, cancel: &AtomicBool) -> Result<(Child, String), String> {
 /// so nobody has to set it up on playit.gg by hand.
 fn watch_tunnel(secret: &str, tunnel: &Mutex<Tunnel>, cancel: &AtomicBool, log: &Log) {
     let mut tried_create = false;
+    // kept so a failed create stays on screen instead of being replaced by "waiting"
+    let mut create_error: Option<String> = None;
     while !cancel.load(Ordering::SeqCst) {
         let state = match api_auth("/v1/agents/rundata", serde_json::json!({}), secret) {
             Ok(r) => match tunnel_state(&r) {
                 Some(t) => t,
-                None if tried_create => Tunnel::Waiting("Waiting for playit.gg to set up the tunnel...".into()),
+                None if tried_create => {
+                    Tunnel::Waiting(create_error.clone().unwrap_or("Waiting for playit.gg to set up the tunnel...".into()))
+                }
                 None => {
                     tried_create = true;
                     push(log, "Creating a Minecraft tunnel on playit.gg.");
@@ -127,6 +131,7 @@ fn watch_tunnel(secret: &str, tunnel: &Mutex<Tunnel>, cancel: &AtomicBool, log: 
                         Ok(()) => Tunnel::Waiting("Creating the tunnel...".into()),
                         Err(e) => {
                             push(log, format!("ERROR: {e}"));
+                            create_error = Some(e.clone());
                             Tunnel::Waiting(e)
                         }
                     }
@@ -162,19 +167,21 @@ fn tunnel_state(r: &serde_json::Value) -> Option<Tunnel> {
     Some(Tunnel::Waiting(format!("playit.gg is setting up the tunnel: {}", pending["status_msg"].as_str().unwrap_or("pending"))))
 }
 
+/// Uses /tunnels/create: the live API rejects every body for /v1/tunnels/create
+/// ("failed to parse body"), while this older endpoint accepts agent keys.
 fn create_tunnel(secret: &str, agent_id: &str) -> Result<(), String> {
     let body = serde_json::json!({
-        "ports": {"type": "tunnel-type", "details": "minecraft-java"},
-        "origin": {"type": "agent", "data": {
-            "agent_id": agent_id,
-            "config": {"fields": [{"name": "local_ip", "value": "127.0.0.1"}, {"name": "local_port", "value": "25565"}]}
-        }},
+        "name": "Minecraft (Octo Servers)",
+        "tunnel_type": "minecraft-java",
+        "port_type": "tcp",
+        "port_count": 1,
+        "origin": {"type": "agent", "data": {"agent_id": agent_id, "local_ip": "127.0.0.1", "local_port": 25565}},
         "enabled": true,
         "alloc": null,
-        "name": "Minecraft (Octo Servers)",
-        "firewall_id": null
+        "firewall_id": null,
+        "proxy_protocol": null
     });
-    let r = api_auth("/v1/tunnels/create", body, secret)?;
+    let r = api_auth("/tunnels/create", body, secret)?;
     match r["status"].as_str() {
         Some("success") => Ok(()),
         _ => Err(match r["data"].as_str().or(r["data"]["message"].as_str()).unwrap_or("unknown error") {
@@ -240,6 +247,29 @@ fn claim(log: &Log, cancel: &AtomicBool) -> Result<String, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Creates the Minecraft tunnel on the linked account through Octo's own code, then waits for
+    /// its address. Uses the real saved key; run on purpose only:
+    /// cargo test playit_live -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn playit_live() {
+        let secret = std::fs::read_to_string(data_dir().join("playit/secret.txt")).unwrap().trim().to_string();
+        let r = api_auth("/v1/agents/rundata", json!({}), &secret).unwrap();
+        if tunnel_state(&r).is_none() {
+            create_tunnel(&secret, r["data"]["agent_id"].as_str().unwrap()).unwrap();
+        }
+        for _ in 0..30 {
+            let st = tunnel_state(&api_auth("/v1/agents/rundata", json!({}), &secret).unwrap());
+            println!("{st:?}");
+            if let Some(Tunnel::Ready(addr)) = st {
+                assert!(!addr.is_empty());
+                return;
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+        panic!("no address after 60s");
+    }
 
     #[test]
     fn reads_tunnel_address() {
