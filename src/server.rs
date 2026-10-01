@@ -353,6 +353,31 @@ mod tests {
     }
     use super::*;
 
+    /// Servers made by the very first release (octo.json with only these four fields) must still load,
+    /// start the same way, and keep their file format when saved again.
+    #[test]
+    fn loads_servers_from_first_version() {
+        let root = std::env::temp_dir().join(format!("octo-v1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (name, flavor) in [("smp", "Paper"), ("fabric", "Fabric"), ("modded", "Forge"), ("neo", "NeoForge"), ("plain", "Vanilla")] {
+            let dir = root.join(name);
+            std::fs::create_dir_all(dir.join("world")).unwrap();
+            let v1 =
+                format!("{{\n  \"flavor\": \"{flavor}\",\n  \"mc_version\": \"1.21.1\",\n  \"java_major\": 21,\n  \"ram_mb\": 4096\n}}");
+            std::fs::write(dir.join("octo.json"), &v1).unwrap();
+            std::fs::write(dir.join("server.jar"), "").unwrap();
+            let srv = load(dir.clone()).expect("first-version server loads");
+            assert_eq!((srv.cfg.mc_version.as_str(), srv.cfg.java_major, srv.cfg.ram_mb), ("1.21.1", 21, 4096));
+            assert!(srv.cfg.launch.is_none(), "old servers keep using the normal launch for their type");
+            srv.save().unwrap();
+            assert_eq!(std::fs::read_to_string(dir.join("octo.json")).unwrap(), v1, "saving doesn't change the format");
+            assert!(dir.join("world").is_dir(), "world untouched");
+        }
+        let smp = load(root.join("smp")).unwrap();
+        assert_eq!(crate::flavors::launch_args(smp.cfg.flavor, &smp.dir).unwrap(), ["-jar", "server.jar", "nogui"]);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn crash_messages() {
         let l = |s: &str| vec![s.to_string()];
