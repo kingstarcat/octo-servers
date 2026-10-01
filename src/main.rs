@@ -9,6 +9,7 @@ mod project;
 mod server;
 mod sources;
 mod update;
+mod worlds;
 
 use dashboard::{Act, Tab};
 use eframe::egui;
@@ -317,13 +318,24 @@ struct NewDialog {
     version: String,
     ram_mb: u32,
     eula: bool,
+    src: Source,
     // modpack / server-files import
-    pack: bool,
     link: String,
     query: String,
     results: Results,
     over_flavor: Option<Flavor>,
     over_mc: String,
+    // from a world: launcher worlds (scanned when the tab opens) and the pick
+    found: Option<Vec<worlds::Found>>,
+    world: Option<PathBuf>,
+    world_mods: bool,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum Source {
+    Blank,
+    Pack,
+    World,
 }
 
 impl NewDialog {
@@ -335,12 +347,15 @@ impl NewDialog {
             version: String::new(),
             ram_mb: 4096,
             eula: false,
-            pack: false,
+            src: Source::Blank,
             link: String::new(),
             query: String::new(),
             results: Default::default(),
             over_flavor: None,
             over_mc: String::new(),
+            found: None,
+            world: None,
+            world_mods: true,
         };
         d.fetch();
         d
@@ -377,6 +392,8 @@ struct App {
     /// start this server once the running task (the pre-start backup) succeeds
     start_after: Option<String>,
     confirm_delete: Option<String>,
+    /// server name, and the worlds found on this PC
+    confirm_import: Option<(String, Vec<worlds::Found>)>,
     /// a newer Octo release (filled by the startup check), and whether it's been installed
     update: Arc<Mutex<Option<update::Release>>>,
     update_dismissed: bool,
@@ -409,6 +426,7 @@ impl App {
             show_settings: false,
             start_after: None,
             confirm_delete: None,
+            confirm_import: None,
             update: Default::default(),
             update_dismissed: false,
             updated_exe: Default::default(),
@@ -700,6 +718,7 @@ impl eframe::App for App {
                     let (dir, name) = (s.dir.clone(), s.name.clone());
                     self.run_task(format!("Backing up {name}"), move |log| server::backup(&dir, false, log).map(|_| ()));
                 }
+                Some(Act::ImportWorld) => self.confirm_import = Some((self.servers[self.sel].name.clone(), worlds::scan())),
                 Some(Act::Delete) => self.confirm_delete = Some(self.servers[self.sel].name.clone()),
                 None => {}
             }
@@ -709,6 +728,7 @@ impl eframe::App for App {
         self.page_window(&ctx);
         self.settings_window(&ctx);
         self.delete_window(&ctx);
+        self.import_window(&ctx);
     }
 }
 
@@ -820,20 +840,41 @@ impl App {
         let mut open = true;
         let mut create = false;
         let mut open_page = None;
-        if d.pack
+        if d.src == Source::Pack
             && let Some(p) = ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf()))
         {
             d.link = p.display().to_string();
         }
         egui::Window::new("New server").open(&mut open).collapsible(false).default_width(560.0).show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut d.pack, false, "Blank server");
-                if ui.selectable_value(&mut d.pack, true, "Modpack / server files").clicked() && d.ram_mb < 6144 {
+                ui.selectable_value(&mut d.src, Source::Blank, "Blank server");
+                let pack = ui.selectable_value(&mut d.src, Source::Pack, "Modpack / server files").clicked();
+                let world = ui.selectable_value(&mut d.src, Source::World, "From a world").clicked();
+                if (pack || world) && d.ram_mb < 6144 {
                     d.ram_mb = 6144;
                 }
             });
             ui.separator();
-            if d.pack {
+            if d.src == Source::World {
+                if let Some(p) = world_picker(ui, d.found.get_or_insert_with(worlds::scan)) {
+                    if d.name.is_empty() {
+                        let n = p.file_stem().unwrap_or_default().to_string_lossy();
+                        d.name = n
+                            .chars()
+                            .filter(|c| c.is_ascii_alphanumeric() || " -_".contains(*c))
+                            .take(40)
+                            .collect::<String>()
+                            .trim()
+                            .into();
+                    }
+                    d.world = Some(p);
+                }
+                if let Some(p) = &d.world {
+                    ui.label(format!("World: {}", p.display()));
+                }
+                ui.checkbox(&mut d.world_mods, "Add mods and configs");
+            }
+            if d.src == Source::Pack {
                 ui.horizontal(|ui| {
                     let r = ui.add(egui::TextEdit::singleline(&mut d.query).hint_text("Search Modrinth modpacks"));
                     if ui.button("Search").clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
@@ -886,7 +927,7 @@ impl App {
                 ui.label("Name");
                 ui.text_edit_singleline(&mut d.name);
                 ui.end_row();
-                if d.pack {
+                if d.src != Source::Blank {
                     ui.label("RAM");
                     ui.vertical(|ui| {
                         ui.add(egui::Slider::new(&mut d.ram_mb, 1024..=dashboard::ram_max()).step_by(512.0).suffix(" MB"));
@@ -945,10 +986,10 @@ impl App {
             if let Some(e) = &err {
                 ui.weak(e);
             }
-            let ready = if d.pack {
-                !d.link.trim().is_empty() && (d.over_flavor.is_none() || !d.over_mc.trim().is_empty())
-            } else {
-                !d.version.is_empty()
+            let ready = match d.src {
+                Source::Pack => !d.link.trim().is_empty() && (d.over_flavor.is_none() || !d.over_mc.trim().is_empty()),
+                Source::World => d.world.is_some(),
+                Source::Blank => !d.version.is_empty(),
             };
             let ok = err.is_none() && d.eula && ready;
             create = ui.add_enabled(ok, egui::Button::new("Create")).clicked();
@@ -959,7 +1000,15 @@ impl App {
         if create {
             let d = self.new.take().unwrap();
             let name = d.name.trim().to_string();
-            if d.pack {
+            if let Some(src) = d.world.clone().filter(|_| d.src == Source::World) {
+                let (ram, with_mods) = (d.ram_mb, d.world_mods);
+                self.run_task(format!("Creating {name} from a world"), move |log| {
+                    server::create_with(&name, ram, log, |dir, log| worlds::import(&src, dir, with_mods, log))?;
+                    worlds::test_start(&server::servers_dir().join(&name), log)
+                });
+                return;
+            }
+            if d.src == Source::Pack {
                 let (src, ram) = (d.link.trim().to_string(), d.ram_mb);
                 let over = d.over_flavor.map(|f| (f, d.over_mc.trim().to_string()));
                 self.run_task(format!("Importing {name}"), move |log| {
@@ -977,10 +1026,40 @@ impl App {
 
 fn use_pack(d: &mut NewDialog, link: String, slug: &str) {
     d.link = link;
-    d.pack = true;
+    d.src = Source::Pack;
     if d.name.is_empty() {
         d.name = slug.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').take(40).collect();
     }
+}
+
+/// Worlds found on this PC, and pickers for ones elsewhere. Returns the picked world.
+fn world_picker(ui: &mut egui::Ui, found: &[worlds::Found]) -> Option<PathBuf> {
+    let mut pick = None;
+    if found.is_empty() {
+        ui.weak("No worlds found in the Minecraft launcher, CurseForge, Prism, Modrinth, ATLauncher, GDLauncher, FTB or Technic folders.");
+    } else {
+        egui::ScrollArea::vertical().id_salt("worlds").max_height(220.0).show(ui, |ui| {
+            egui::Grid::new("worlds").num_columns(3).striped(true).show(ui, |ui| {
+                for w in found {
+                    ui.label(&w.name);
+                    ui.weak(&w.place);
+                    if ui.button("Use").clicked() {
+                        pick = Some(w.dir.clone());
+                    }
+                    ui.end_row();
+                }
+            });
+        });
+    }
+    ui.horizontal(|ui| {
+        if ui.button("Choose folder...").clicked() {
+            pick = rfd::FileDialog::new().pick_folder();
+        }
+        if ui.button("Choose zip...").clicked() {
+            pick = rfd::FileDialog::new().add_filter("World zip", &["zip"]).pick_file();
+        }
+    });
+    pick
 }
 
 fn bytes(n: f64) -> String {
@@ -1107,6 +1186,32 @@ impl App {
         }
     }
 
+    fn import_window(&mut self, ctx: &egui::Context) {
+        let Some((name, found)) = &self.confirm_import else { return };
+        let Some(dir) = self.servers.iter().find(|s| &s.name == name).map(|s| s.dir.clone()) else { return };
+        let (mut close, mut pick) = (false, None);
+        egui::Window::new("Import world").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(
+            ctx,
+            |ui| {
+                ui.label(format!("Replace the world of \"{name}\" with a world from this PC."));
+                if server::has_world(&dir) {
+                    ui.label("The current world is backed up first.");
+                }
+                ui.weak("Only the world is copied. To bring a modded world's mods too, use New server and pick From a world.");
+                pick = world_picker(ui, found);
+                close = ui.button("Cancel").clicked();
+            },
+        );
+        let name = name.clone();
+        if let Some(src) = pick {
+            self.run_task(format!("Importing a world into {name}"), move |log| server::import_world(&dir, &src, log));
+            close = true;
+        }
+        if close {
+            self.confirm_import = None;
+        }
+    }
+
     fn settings_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_settings;
         egui::Window::new("Settings").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
@@ -1210,6 +1315,9 @@ mod tests {
         app.show_settings = true;
         (0..3).for_each(|_| frame(&mut app));
         app.confirm_delete = None;
+        app.confirm_import = Some((app.servers[0].name.clone(), worlds::scan()));
+        (0..3).for_each(|_| frame(&mut app));
+        app.confirm_import = None;
         app.show_settings = false;
         app.servers[0].crash = None;
         // A fake "java" that prints a join line and echoes commands until `stop` (unix only).
@@ -1239,6 +1347,11 @@ mod tests {
         app.new = Some(NewDialog::new());
         app.show_settings = true;
         app.servers.clear();
+        (0..3).for_each(|_| frame(&mut app));
+        let mut d = NewDialog::new();
+        d.src = Source::World;
+        d.world = Some(data.join("My World"));
+        app.new = Some(d);
         (0..3).for_each(|_| frame(&mut app));
         std::fs::remove_dir_all(&data).unwrap();
     }

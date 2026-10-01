@@ -222,11 +222,79 @@ pub fn diagnose(lines: &[String], java: u32, port: u16) -> String {
     }
 }
 
+fn level_name(dir: &Path) -> String {
+    let props = std::fs::read_to_string(dir.join("server.properties")).unwrap_or_default();
+    crate::dashboard::props_get(&props, "level-name").filter(|l| !l.is_empty()).unwrap_or("world".into())
+}
+
 /// Folders holding the world: level-name (default "world") plus Paper's split dimensions.
 fn world_dirs(dir: &Path) -> Vec<PathBuf> {
-    let props = std::fs::read_to_string(dir.join("server.properties")).unwrap_or_default();
-    let level = crate::dashboard::props_get(&props, "level-name").filter(|l| !l.is_empty()).unwrap_or("world".into());
+    let level = level_name(dir);
     [level.clone(), format!("{level}_nether"), format!("{level}_the_end")].into_iter().map(|l| dir.join(l)).filter(|p| p.is_dir()).collect()
+}
+
+/// The folder holding level.dat: `src` itself or one a few levels down (wrapper folders, a server
+/// folder). Paper's `<name>_nether` / `<name>_the_end` also have level.dat; they're skipped here and
+/// picked up beside the main one.
+fn find_level(src: &Path, depth: u32) -> Option<PathBuf> {
+    if src.join("level.dat").is_file() {
+        return Some(src.into());
+    }
+    let mut subs: Vec<PathBuf> = std::fs::read_dir(src)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_dir()
+                && !p.file_name().is_some_and(|f| f.to_string_lossy().ends_with("_nether") || f.to_string_lossy().ends_with("_the_end"))
+        })
+        .collect();
+    subs.sort();
+    // ponytail: a folder of several worlds (e.g. all of saves) takes the first by name; the log says which.
+    (depth > 0).then(|| subs.iter().find_map(|p| find_level(p, depth - 1))).flatten()
+}
+
+/// Replace the server's world with one from a world folder or a zip of one (a downloaded map,
+/// a singleplayer save, an Octo backup). The current world is backed up first.
+pub fn import_world(dir: &Path, src: &Path, log: &Log) -> Result<(), String> {
+    if src.is_dir() && src.canonicalize().ok().zip(dir.canonicalize().ok()).is_some_and(|(a, b)| a.starts_with(b)) {
+        return Err("That folder is inside this server's own folder. Pick a world from somewhere else.".into());
+    }
+    let tmp = dir.join("_world_import");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let r = (|| {
+        let from = if src.is_dir() {
+            src.to_path_buf()
+        } else {
+            std::fs::create_dir_all(&tmp).map_err(s)?;
+            crate::packs::extract(src, &tmp, log)?;
+            tmp.clone()
+        };
+        let world = find_level(&from, 3)
+            .ok_or("No Minecraft world found there. Pick the world's folder (the one with level.dat in it) or a zip of it.")?;
+        push(log, format!("Importing the world in {}", world.display()));
+        if has_world(dir) {
+            backup(dir, false, log)?;
+        }
+        for w in world_dirs(dir) {
+            std::fs::remove_dir_all(&w).map_err(|e| format!("Couldn't remove the old world: {e}"))?;
+        }
+        let (level, name) = (level_name(dir), world.file_name().unwrap_or_default().to_string_lossy().to_string());
+        let mut n = 0;
+        for suffix in ["", "_nether", "_the_end"] {
+            let from = world.with_file_name(format!("{name}{suffix}"));
+            if from.is_dir() {
+                let to = dir.join(format!("{level}{suffix}"));
+                std::fs::create_dir_all(&to).map_err(s)?;
+                n += crate::packs::copy_dir(&from, &to)?;
+            }
+        }
+        push(log, format!("Copied {n} world files"));
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&tmp);
+    r
 }
 
 pub fn has_world(dir: &Path) -> bool {
@@ -425,6 +493,44 @@ mod tests {
         assert_eq!(files.iter().filter(|f| f.starts_with("auto-")).count(), KEEP_AUTO_BACKUPS);
         assert_eq!(files.iter().filter(|f| !f.starts_with("auto-")).count(), 1, "manual backups are never pruned");
         assert!(backup(&d.join("nope"), false, &log).is_err());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn imports_worlds_from_folders_and_zips() {
+        let d = std::env::temp_dir().join(format!("octo-import-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let (a, b) = (d.join("a"), d.join("b"));
+        // a: a Paper server with split dimensions and a custom level-name
+        std::fs::create_dir_all(a.join("smp_nether")).unwrap();
+        std::fs::create_dir_all(a.join("smp/region")).unwrap();
+        std::fs::write(a.join("server.properties"), "level-name=smp\n").unwrap();
+        std::fs::write(a.join("smp/level.dat"), "A").unwrap();
+        std::fs::write(a.join("smp/region/r.0.0.mca"), "R").unwrap();
+        std::fs::write(a.join("smp_nether/level.dat"), "N").unwrap();
+        // b: has its own world that gets replaced (and backed up)
+        std::fs::create_dir_all(b.join("world")).unwrap();
+        std::fs::write(b.join("world/level.dat"), "old").unwrap();
+        let log = Log::default();
+
+        // an Octo backup zip restores, renamed to b's level-name, nether included
+        let zip = backup(&a, false, &log).unwrap();
+        import_world(&b, &zip, &log).unwrap();
+        assert_eq!(std::fs::read_to_string(b.join("world/region/r.0.0.mca")).unwrap(), "R");
+        assert_eq!(std::fs::read_to_string(b.join("world_nether/level.dat")).unwrap(), "N");
+        assert!(!b.join("_world_import").exists());
+        assert_eq!(std::fs::read_dir(b.join("backups")).unwrap().count(), 1, "old world backed up");
+
+        // a singleplayer save inside a wrapper folder
+        std::fs::create_dir_all(d.join("dl/My Map")).unwrap();
+        std::fs::write(d.join("dl/My Map/level.dat"), "map").unwrap();
+        import_world(&b, &d.join("dl"), &log).unwrap();
+        assert_eq!(std::fs::read_to_string(b.join("world/level.dat")).unwrap(), "map");
+        assert!(!b.join("world_nether").exists(), "old dimensions removed");
+
+        assert!(import_world(&b, &d.join("a/smp_nether/nope"), &log).is_err());
+        assert!(import_world(&b, &b.join("world"), &log).is_err(), "own world");
+        assert!(import_world(&b, &a.join("smp/region"), &log).unwrap_err().contains("No Minecraft world"));
         std::fs::remove_dir_all(&d).unwrap();
     }
 

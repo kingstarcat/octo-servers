@@ -24,6 +24,7 @@ pub enum Act {
     Restart,
     Playit,
     Backup,
+    ImportWorld,
     Delete,
 }
 
@@ -257,6 +258,11 @@ pub fn dashboard(ui: &mut egui::Ui, srv: &mut Server, ip: &str, playit: &crate::
                     act = Some(Act::Backup);
                 }
                 r.on_disabled_hover_text(if running { "Stop the server first" } else { "No world yet" });
+                let r = ui.add_enabled(!running && !busy, egui::Button::new("Import world"));
+                if r.clicked() {
+                    act = Some(Act::ImportWorld);
+                }
+                r.on_disabled_hover_text("Stop the server first");
                 if srv.dir.join("backups").is_dir() && ui.button("Open backups").clicked() {
                     open_folder(&srv.dir.join("backups"));
                 }

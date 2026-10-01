@@ -149,7 +149,7 @@ pub struct ModUpdate {
     pub url: String,
 }
 
-fn sha1_file(p: &Path) -> Option<String> {
+pub fn sha1_file(p: &Path) -> Option<String> {
     Some(sha1_smol::Sha1::from(std::fs::read(p).ok()?).digest().to_string())
 }
 
@@ -192,6 +192,31 @@ pub fn check_mod_updates(dir: &Path, mc: &str, f: Flavor) -> Result<Vec<ModUpdat
             Some(ModUpdate { file, new_name: url_file_name(pf["filename"].as_str()?), url: pf["url"].as_str()?.to_string() })
         })
         .collect())
+}
+
+/// Of these jar sha1s, the ones Modrinth knows as client-only (server_side "unsupported").
+pub fn client_only_hashes(hashes: &[String]) -> Result<Vec<String>, String> {
+    if hashes.is_empty() {
+        return Ok(vec![]);
+    }
+    let versions: Value = ureq::post(format!("{MR}/version_files"))
+        .header("User-Agent", UA)
+        .send_json(serde_json::json!({ "hashes": hashes, "algorithm": "sha1" }))
+        .map_err(s)?
+        .body_mut()
+        .with_config()
+        .limit(50 << 20)
+        .read_json()
+        .map_err(s)?;
+    let by_project: Vec<(&String, &str)> = hashes.iter().filter_map(|h| Some((h, versions[h]["project_id"].as_str()?))).collect();
+    if by_project.is_empty() {
+        return Ok(vec![]);
+    }
+    let ids = serde_json::to_string(&by_project.iter().map(|(_, p)| p).collect::<Vec<_>>()).map_err(s)?;
+    let projects = get_json(&format!("{MR}/projects?ids={}", enc(&ids)))?;
+    let client: Vec<&str> =
+        projects.as_array().into_iter().flatten().filter(|p| p["server_side"] == "unsupported").filter_map(|p| p["id"].as_str()).collect();
+    Ok(by_project.into_iter().filter(|(_, p)| client.contains(p)).map(|(h, _)| h.clone()).collect())
 }
 
 /// Download the new jar next to the old one, then remove the old one.
@@ -253,6 +278,16 @@ fn cf_files(pid: u64, done: impl Fn(&[Value]) -> bool) -> Result<Vec<Value>, Str
 
 /// CurseForge redirects downloads to edge.forgecdn.net, which 404s for many files;
 /// mediafilez.forgecdn.net serves the same paths.
+/// CurseForge tags each file with the sides it runs on; "Client" without "Server" = client-only.
+/// Untagged files (or a failed lookup) count as not client-only.
+pub fn cf_client_only(pid: u64, fid: u64) -> bool {
+    get_json(&format!("{CF}/{pid}/files/{fid}")).is_ok_and(|v| {
+        let tags = &v["data"]["gameVersions"];
+        let has = |t: &str| tags.as_array().is_some_and(|a| a.iter().any(|x| x == t));
+        has("Client") && !has("Server")
+    })
+}
+
 pub fn cf_download_url(pid: u64, fid: u64) -> Result<String, String> {
     let agent: ureq::Agent =
         ureq::Agent::config_builder().max_redirects(0).max_redirects_will_error(false).http_status_as_error(false).build().into();

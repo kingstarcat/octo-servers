@@ -2410,6 +2410,7 @@ dependencies = [
  "eframe",
  "egui_commonmark",
  "egui_extras",
+ "flate2",
  "image",
  "rfd",
  "serde",

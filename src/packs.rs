@@ -70,7 +70,7 @@ fn server_root(src: &Path) -> PathBuf {
     }
 }
 
-fn copy_dir(src: &Path, dst: &Path) -> Result<usize, String> {
+pub fn copy_dir(src: &Path, dst: &Path) -> Result<usize, String> {
     let mut n = 0;
     for e in std::fs::read_dir(src).map_err(s)?.flatten() {
         let (from, to) = (e.path(), dst.join(e.file_name()));
@@ -148,7 +148,7 @@ fn safe_join(dir: &Path, rel: &str) -> Option<PathBuf> {
 /// Folders that mean "this is already the server root", so don't strip them as a wrapper folder.
 const ROOT_DIRS: &[&str] = &["mods", "config", "libraries", "plugins", "world", "overrides", "defaultconfigs", "kubejs"];
 
-fn extract(zip: &Path, dir: &Path, log: &Log) -> Result<(), String> {
+pub fn extract(zip: &Path, dir: &Path, log: &Log) -> Result<(), String> {
     let mut a = zip::ZipArchive::new(std::fs::File::open(zip).map_err(s)?).map_err(|e| format!("not a zip: {e}"))?;
     // enclosed_name() rejects absolute paths and `..` (zip-slip).
     let names: Vec<Option<PathBuf>> = (0..a.len()).map(|i| a.by_index_raw(i).ok().and_then(|f| f.enclosed_name())).collect();
