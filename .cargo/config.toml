@@ -1,0 +1,3 @@
+# Static CRT so octo.exe runs without the Visual C++ redistributable
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
