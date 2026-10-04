@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod browser;
 mod dashboard;
 mod flavors;
 mod java;
@@ -254,9 +255,23 @@ type ModUpdates = Arc<Mutex<Option<Result<Vec<sources::ModUpdate>, String>>>>;
 type Results = Arc<Mutex<Option<Result<Vec<sources::Hit>, String>>>>;
 
 fn search(query: String, kind: &'static str, mc: Option<String>, f: Option<Flavor>) -> Results {
+    spawn_search(move || sources::modrinth_search(&query, kind, mc.as_deref(), f))
+}
+
+type Searches = std::collections::HashMap<Source, (String, Results)>;
+
+/// Keep each provider's query and results when switching to another one and back.
+fn switch_search(saved: &mut Searches, from: Source, to: Source, query: &mut String, results: &mut Results) {
+    if from != to {
+        let (q, r) = saved.remove(&to).unwrap_or_default();
+        saved.insert(from, (std::mem::replace(query, q), std::mem::replace(results, r)));
+    }
+}
+
+fn spawn_search(f: impl FnOnce() -> Result<Vec<sources::Hit>, String> + Send + 'static) -> Results {
     let r = Results::default();
     let out = r.clone();
-    std::thread::spawn(move || *out.lock().unwrap() = Some(sources::modrinth_search(&query, kind, mc.as_deref(), f)));
+    std::thread::spawn(move || *out.lock().unwrap() = Some(f()));
     r
 }
 
@@ -294,7 +309,10 @@ fn hits(ui: &mut egui::Ui, id: &str, results: &Results, button: &str, enabled: b
                                 picked = Some(Pick::Use(h.slug.clone()));
                             }
                             ui.strong(&h.title);
-                            ui.weak(format!("{} downloads", project::short(h.downloads)));
+                            // Technic and ATLauncher don't report download counts
+                            if h.downloads > 0 {
+                                ui.weak(format!("{} downloads", project::short(h.downloads)));
+                            }
                         });
                         ui.weak(&h.description);
                     });
@@ -323,6 +341,8 @@ struct NewDialog {
     link: String,
     query: String,
     results: Results,
+    /// other providers' query and results, kept while their tab isn't shown
+    searches: Searches,
     over_flavor: Option<Flavor>,
     over_mc: String,
     // from a world: launcher worlds (scanned when the tab opens) and the pick
@@ -331,11 +351,21 @@ struct NewDialog {
     world_mods: bool,
 }
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
 enum Source {
     Blank,
     Pack,
     World,
+    Modrinth,
+    CurseForge,
+    Technic,
+    ATLauncher,
+}
+
+impl Source {
+    fn is_pack(self) -> bool {
+        matches!(self, Self::Pack | Self::Modrinth | Self::CurseForge | Self::Technic | Self::ATLauncher)
+    }
 }
 
 impl NewDialog {
@@ -351,6 +381,7 @@ impl NewDialog {
             link: String::new(),
             query: String::new(),
             results: Default::default(),
+            searches: Default::default(),
             over_flavor: None,
             over_mc: String::new(),
             found: None,
@@ -387,6 +418,9 @@ struct App {
     mod_link: String,
     mod_results: Results,
     page: Option<project::Page>,
+    cf_search: Option<browser::Search>,
+    mod_source: Source,
+    mod_searches: Searches,
     settings: Settings,
     show_settings: bool,
     /// start this server once the running task (the pre-start backup) succeeds
@@ -422,6 +456,9 @@ impl App {
             mod_link: String::new(),
             mod_results: Default::default(),
             page: None,
+            cf_search: None,
+            mod_source: Source::Modrinth,
+            mod_searches: Default::default(),
             settings: Settings::load(),
             show_settings: false,
             start_after: None,
@@ -534,7 +571,7 @@ fn console(ui: &mut egui::Ui, id: &str, log: &Log) {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         ctx.request_repaint_after(Duration::from_millis(250));
         self.poll_task();
@@ -542,6 +579,13 @@ impl eframe::App for App {
             if self.servers[i].restart && !self.servers[i].running() {
                 self.servers[i].restart = false;
                 self.start_now(i);
+            }
+        }
+
+        if let Some(search) = &mut self.cf_search {
+            ctx.request_repaint_after(Duration::from_millis(50));
+            if search.poll(frame) {
+                self.cf_search = None;
             }
         }
 
@@ -739,9 +783,21 @@ impl App {
         let (dir, mc, flavor) = (srv.dir.clone(), srv.cfg.mc_version.clone(), srv.cfg.flavor);
         let mut add = None;
         ui.horizontal(|ui| {
-            let r = ui.add(egui::TextEdit::singleline(&mut self.mod_query).hint_text("Search Modrinth"));
+            let before = self.mod_source;
+            ui.selectable_value(&mut self.mod_source, Source::Modrinth, "Modrinth");
+            ui.selectable_value(&mut self.mod_source, Source::CurseForge, "CurseForge");
+            switch_search(&mut self.mod_searches, before, self.mod_source, &mut self.mod_query, &mut self.mod_results);
+        });
+        ui.horizontal(|ui| {
+            let r = ui.add(egui::TextEdit::singleline(&mut self.mod_query).hint_text("Search Modrinth/CurseForge"));
             if ui.button("Search").clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
-                self.mod_results = search(self.mod_query.clone(), "mod", Some(mc.clone()), Some(flavor));
+                if self.mod_source == Source::CurseForge {
+                    self.mod_results = Default::default();
+                    let class = if flavor == Flavor::Paper { "bukkit-plugins" } else { "mc-mods" };
+                    self.cf_search = Some(browser::Search::new(&self.mod_query, class, Some(&mc), Some(flavor), self.mod_results.clone()));
+                } else {
+                    self.mod_results = search(self.mod_query.clone(), "mod", Some(mc.clone()), Some(flavor));
+                }
             }
         });
         ui.horizontal(|ui| {
@@ -804,12 +860,17 @@ impl App {
             });
         }
         ui.columns(2, |cols| {
-            cols[0].strong(format!("Modrinth results for {flavor:?} {mc}"));
+            let site = if self.mod_source == Source::CurseForge { "CurseForge" } else { "Modrinth" };
+            cols[0].strong(format!("{site} results for {flavor:?} {mc}"));
             match hits(&mut cols[0], "mod_hits", &self.mod_results, "Install", !busy) {
                 Some(Pick::Use(slug)) => add = Some(slug),
                 Some(Pick::Open(slug)) => {
-                    let target = project::Target::Server { dir: dir.clone(), mc: mc.clone(), flavor };
-                    self.page = Some(project::Page::open(slug, target));
+                    if sources::parse_cf(&slug).is_some() {
+                        cols[0].ctx().open_url(egui::OpenUrl::new_tab(slug));
+                    } else {
+                        let target = project::Target::Server { dir: dir.clone(), mc: mc.clone(), flavor };
+                        self.page = Some(project::Page::open(slug, target));
+                    }
                 }
                 None => {}
             }
@@ -840,162 +901,214 @@ impl App {
         let mut open = true;
         let mut create = false;
         let mut open_page = None;
-        if d.src == Source::Pack
+        if d.src.is_pack()
             && let Some(p) = ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf()))
         {
             d.link = p.display().to_string();
         }
-        egui::Window::new("New server").open(&mut open).collapsible(false).default_width(560.0).show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut d.src, Source::Blank, "Blank server");
-                let pack = ui.selectable_value(&mut d.src, Source::Pack, "Modpack / server files").clicked();
-                let world = ui.selectable_value(&mut d.src, Source::World, "From a world").clicked();
-                if (pack || world) && d.ram_mb < 6144 {
-                    d.ram_mb = 6144;
-                }
-            });
-            ui.separator();
-            if d.src == Source::World {
-                if let Some(p) = world_picker(ui, d.found.get_or_insert_with(worlds::scan)) {
-                    if d.name.is_empty() {
-                        let n = p.file_stem().unwrap_or_default().to_string_lossy();
-                        d.name = n
-                            .chars()
-                            .filter(|c| c.is_ascii_alphanumeric() || " -_".contains(*c))
-                            .take(40)
-                            .collect::<String>()
-                            .trim()
-                            .into();
+        egui::Window::new("New server").open(&mut open).collapsible(false).default_width(700.0).show(ctx, |ui| {
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(110.0);
+                    let before = d.src;
+                    for (source, label) in [
+                        (Source::Blank, "Custom"),
+                        (Source::Pack, "Import"),
+                        (Source::World, "World"),
+                        (Source::Modrinth, "Modrinth"),
+                        (Source::CurseForge, "CurseForge"),
+                        (Source::Technic, "Technic"),
+                        (Source::ATLauncher, "ATLauncher"),
+                    ] {
+                        ui.selectable_value(&mut d.src, source, label);
                     }
-                    d.world = Some(p);
-                }
-                if let Some(p) = &d.world {
-                    ui.label(format!("World: {}", p.display()));
-                }
-                ui.checkbox(&mut d.world_mods, "Add mods and configs");
-            }
-            if d.src == Source::Pack {
-                ui.horizontal(|ui| {
-                    let r = ui.add(egui::TextEdit::singleline(&mut d.query).hint_text("Search Modrinth modpacks"));
-                    if ui.button("Search").clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
-                        d.results = search(d.query.clone(), "modpack", None, None);
-                    }
-                });
-                ui.allocate_ui(egui::vec2(ui.available_width(), 220.0), |ui| match hits(ui, "pack_hits", &d.results, "Use", true) {
-                    Some(Pick::Use(slug)) => use_pack(d, format!("https://modrinth.com/modpack/{slug}"), &slug),
-                    Some(Pick::Open(slug)) => open_page = Some(slug),
-                    None => {}
-                });
-                ui.label("Modpack or server files:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut d.link)
-                        .hint_text("CurseForge / Modrinth link, .zip / .mrpack URL, or file path (or drop a file here)")
-                        .desired_width(f32::INFINITY),
-                );
-                ui.horizontal(|ui| {
-                    // Native file pickers (the dialog blocks the UI while open, which is fine for a modal pick).
-                    if ui.button("Browse zip...").clicked()
-                        && let Some(p) = rfd::FileDialog::new().add_filter("Modpack / server files", &["zip", "mrpack"]).pick_file()
-                    {
-                        d.link = p.display().to_string();
-                    }
-                    if ui.button("Browse folder...").clicked()
-                        && let Some(p) = rfd::FileDialog::new().pick_folder()
-                    {
-                        d.link = p.display().to_string();
-                    }
-                });
-                ui.weak(
-                    "Downloaded server packs (zip or unzipped folder) work too. CurseForge links use the pack's Server Files when offered.",
-                );
-                ui.horizontal(|ui| {
-                    ui.label("Type");
-                    let name = d.over_flavor.map_or("Auto-detect".into(), |f| format!("{f:?}"));
-                    egui::ComboBox::from_id_salt("over").selected_text(name).show_ui(ui, |ui| {
-                        ui.selectable_value(&mut d.over_flavor, None, "Auto-detect");
-                        for f in Flavor::ALL {
-                            ui.selectable_value(&mut d.over_flavor, Some(f), format!("{f:?}"));
+                    if d.src != before {
+                        switch_search(&mut d.searches, before, d.src, &mut d.query, &mut d.results);
+                        if d.src != Source::Blank && d.ram_mb < 6144 {
+                            d.ram_mb = 6144;
                         }
-                    });
-                    if d.over_flavor.is_some() {
-                        ui.label("Minecraft");
-                        ui.add(egui::TextEdit::singleline(&mut d.over_mc).hint_text("1.20.1").desired_width(80.0));
                     }
                 });
-            }
-            egui::Grid::new("new").num_columns(2).show(ui, |ui| {
-                ui.label("Name");
-                ui.text_edit_singleline(&mut d.name);
-                ui.end_row();
-                if d.src != Source::Blank {
-                    ui.label("RAM");
-                    ui.vertical(|ui| {
-                        ui.add(egui::Slider::new(&mut d.ram_mb, 1024..=dashboard::ram_max()).step_by(512.0).suffix(" MB"));
-                        if let Some(w) = server::ram_warning(d.ram_mb) {
-                            ui.colored_label(ui.visuals().warn_fg_color, w);
+                ui.separator();
+                ui.vertical(|ui| {
+                    ui.set_min_width(520.0);
+                    ui.separator();
+                    if d.src == Source::World {
+                        if let Some(p) = world_picker(ui, d.found.get_or_insert_with(worlds::scan)) {
+                            if d.name.is_empty() {
+                                let n = p.file_stem().unwrap_or_default().to_string_lossy();
+                                d.name = n
+                                    .chars()
+                                    .filter(|c| c.is_ascii_alphanumeric() || " -_".contains(*c))
+                                    .take(40)
+                                    .collect::<String>()
+                                    .trim()
+                                    .into();
+                            }
+                            d.world = Some(p);
                         }
-                    });
-                    ui.end_row();
-                    return;
-                }
-                ui.label("Type");
-                let before = d.flavor;
-                egui::ComboBox::from_id_salt("flavor").selected_text(format!("{:?}", d.flavor)).show_ui(ui, |ui| {
-                    for f in Flavor::ALL {
-                        ui.selectable_value(&mut d.flavor, f, format!("{f:?}"));
-                    }
-                });
-                if d.flavor != before {
-                    d.fetch();
-                }
-                ui.end_row();
-                ui.label("Version");
-                match &*d.versions.lock().unwrap() {
-                    None => {
-                        ui.spinner();
-                    }
-                    Some(Err(e)) => {
-                        ui.colored_label(egui::Color32::RED, e);
-                    }
-                    Some(Ok(vs)) => {
-                        if d.version.is_empty() {
-                            d.version = vs.first().cloned().unwrap_or_default();
+                        if let Some(p) = &d.world {
+                            ui.label(format!("World: {}", p.display()));
                         }
-                        egui::ComboBox::from_id_salt("ver").selected_text(&d.version).height(400.0).show_ui(ui, |ui| {
-                            for v in vs {
-                                ui.selectable_value(&mut d.version, v.clone(), v);
+                        ui.checkbox(&mut d.world_mods, "Add mods and configs");
+                    }
+                    if d.src.is_pack() {
+                        if d.src != Source::Pack {
+                            ui.horizontal(|ui| {
+                                let site = match d.src {
+                                    Source::CurseForge => "CurseForge",
+                                    Source::Technic => "Technic",
+                                    Source::ATLauncher => "ATLauncher",
+                                    _ => "Modrinth",
+                                };
+                                let r = ui.add(egui::TextEdit::singleline(&mut d.query).hint_text(format!("Search {site} modpacks")));
+                                if ui.button("Search").clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                                    if d.src == Source::CurseForge {
+                                        d.results = Default::default();
+                                        self.cf_search = Some(browser::Search::new(&d.query, "modpacks", None, None, d.results.clone()));
+                                    } else {
+                                        let q = d.query.clone();
+                                        d.results = match d.src {
+                                            Source::Technic => spawn_search(move || sources::technic_search(&q)),
+                                            Source::ATLauncher => spawn_search(move || sources::atl_search(&q)),
+                                            _ => search(q, "modpack", None, None),
+                                        };
+                                    }
+                                }
+                            });
+                            ui.allocate_ui(egui::vec2(ui.available_width(), 220.0), |ui| {
+                                match hits(ui, "pack_hits", &d.results, "Use", true) {
+                                    Some(Pick::Use(slug)) => {
+                                        // Modrinth hits are bare slugs; the other sites give the pack's page link
+                                        let link = if slug.starts_with("https://") {
+                                            slug.clone()
+                                        } else {
+                                            format!("https://modrinth.com/modpack/{slug}")
+                                        };
+                                        let name = slug.rsplit('/').next().unwrap_or(&slug);
+                                        use_pack(d, link, name);
+                                    }
+                                    Some(Pick::Open(slug)) => open_page = Some(slug),
+                                    None => {}
+                                }
+                            });
+                        }
+                        ui.label("Modpack or server files:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut d.link)
+                                .hint_text("CurseForge, Modrinth, Technic or ATLauncher link, .zip / .mrpack URL, or file path (or drop a file here)")
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.horizontal(|ui| {
+                            // Native file pickers (the dialog blocks the UI while open, which is fine for a modal pick).
+                            if ui.button("Browse zip...").clicked()
+                                && let Some(p) = rfd::FileDialog::new().add_filter("Modpack / server files", &["zip", "mrpack"]).pick_file()
+                            {
+                                d.link = p.display().to_string();
+                            }
+                            if ui.button("Browse folder...").clicked()
+                                && let Some(p) = rfd::FileDialog::new().pick_folder()
+                            {
+                                d.link = p.display().to_string();
+                            }
+                        });
+                        ui.weak(
+                            "Downloaded server packs (zip or unzipped folder) work too. CurseForge links use the pack's Server Files when offered.",
+                        );
+                        ui.horizontal(|ui| {
+                            ui.label("Type");
+                            let name = d.over_flavor.map_or("Auto-detect".into(), |f| format!("{f:?}"));
+                            egui::ComboBox::from_id_salt("over").selected_text(name).show_ui(ui, |ui| {
+                                ui.selectable_value(&mut d.over_flavor, None, "Auto-detect");
+                                for f in Flavor::ALL {
+                                    ui.selectable_value(&mut d.over_flavor, Some(f), format!("{f:?}"));
+                                }
+                            });
+                            if d.over_flavor.is_some() {
+                                ui.label("Minecraft");
+                                ui.add(egui::TextEdit::singleline(&mut d.over_mc).hint_text("1.20.1").desired_width(80.0));
                             }
                         });
                     }
-                }
-                ui.end_row();
-                ui.label("RAM");
-                ui.vertical(|ui| {
-                    ui.add(egui::Slider::new(&mut d.ram_mb, 1024..=dashboard::ram_max()).step_by(512.0).suffix(" MB"));
-                    if let Some(w) = server::ram_warning(d.ram_mb) {
-                        ui.colored_label(ui.visuals().warn_fg_color, w);
+                    egui::Grid::new("new").num_columns(2).show(ui, |ui| {
+                        ui.label("Name");
+                        ui.text_edit_singleline(&mut d.name);
+                        ui.end_row();
+                        if d.src != Source::Blank {
+                            ui.label("RAM");
+                            ui.vertical(|ui| {
+                                ui.add(egui::Slider::new(&mut d.ram_mb, 1024..=dashboard::ram_max()).step_by(512.0).suffix(" MB"));
+                                if let Some(w) = server::ram_warning(d.ram_mb) {
+                                    ui.colored_label(ui.visuals().warn_fg_color, w);
+                                }
+                            });
+                            ui.end_row();
+                            return;
+                        }
+                        ui.label("Type");
+                        let before = d.flavor;
+                        egui::ComboBox::from_id_salt("flavor").selected_text(format!("{:?}", d.flavor)).show_ui(ui, |ui| {
+                            for f in Flavor::ALL {
+                                ui.selectable_value(&mut d.flavor, f, format!("{f:?}"));
+                            }
+                        });
+                        if d.flavor != before {
+                            d.fetch();
+                        }
+                        ui.end_row();
+                        ui.label("Version");
+                        match &*d.versions.lock().unwrap() {
+                            None => {
+                                ui.spinner();
+                            }
+                            Some(Err(e)) => {
+                                ui.colored_label(egui::Color32::RED, e);
+                            }
+                            Some(Ok(vs)) => {
+                                if d.version.is_empty() {
+                                    d.version = vs.first().cloned().unwrap_or_default();
+                                }
+                                egui::ComboBox::from_id_salt("ver").selected_text(&d.version).height(400.0).show_ui(ui, |ui| {
+                                    for v in vs {
+                                        ui.selectable_value(&mut d.version, v.clone(), v);
+                                    }
+                                });
+                            }
+                        }
+                        ui.end_row();
+                        ui.label("RAM");
+                        ui.vertical(|ui| {
+                            ui.add(egui::Slider::new(&mut d.ram_mb, 1024..=dashboard::ram_max()).step_by(512.0).suffix(" MB"));
+                            if let Some(w) = server::ram_warning(d.ram_mb) {
+                                ui.colored_label(ui.visuals().warn_fg_color, w);
+                            }
+                        });
+                        ui.end_row();
+                    });
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut d.eula, "I agree to the");
+                        ui.hyperlink_to("Minecraft EULA", "https://aka.ms/MinecraftEULA");
+                    });
+                    let err = server::validate_name(&d.name).err();
+                    if let Some(e) = &err {
+                        ui.weak(e);
                     }
+                    let ready = match d.src {
+                        Source::World => d.world.is_some(),
+                        Source::Blank => !d.version.is_empty(),
+                        _ => !d.link.trim().is_empty() && (d.over_flavor.is_none() || !d.over_mc.trim().is_empty()),
+                    };
+                    let ok = err.is_none() && d.eula && ready;
+                    create = ui.add_enabled(ok, egui::Button::new("Create")).clicked();
                 });
-                ui.end_row();
             });
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut d.eula, "I agree to the");
-                ui.hyperlink_to("Minecraft EULA", "https://aka.ms/MinecraftEULA");
-            });
-            let err = server::validate_name(&d.name).err();
-            if let Some(e) = &err {
-                ui.weak(e);
-            }
-            let ready = match d.src {
-                Source::Pack => !d.link.trim().is_empty() && (d.over_flavor.is_none() || !d.over_mc.trim().is_empty()),
-                Source::World => d.world.is_some(),
-                Source::Blank => !d.version.is_empty(),
-            };
-            let ok = err.is_none() && d.eula && ready;
-            create = ui.add_enabled(ok, egui::Button::new("Create")).clicked();
         });
         if let Some(slug) = open_page {
-            self.page = Some(project::Page::open(slug, project::Target::Modpack));
+            if slug.starts_with("https://") {
+                ctx.open_url(egui::OpenUrl::new_tab(slug));
+            } else {
+                self.page = Some(project::Page::open(slug, project::Target::Modpack));
+            }
         }
         if create {
             let d = self.new.take().unwrap();
@@ -1008,7 +1121,7 @@ impl App {
                 });
                 return;
             }
-            if d.src == Source::Pack {
+            if d.src.is_pack() {
                 let (src, ram) = (d.link.trim().to_string(), d.ram_mb);
                 let over = d.over_flavor.map(|f| (f, d.over_mc.trim().to_string()));
                 self.run_task(format!("Importing {name}"), move |log| {
@@ -1026,7 +1139,9 @@ impl App {
 
 fn use_pack(d: &mut NewDialog, link: String, slug: &str) {
     d.link = link;
-    d.src = Source::Pack;
+    if !d.src.is_pack() {
+        d.src = Source::Pack;
+    }
     if d.name.is_empty() {
         d.name = slug.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').take(40).collect();
     }
@@ -1245,6 +1360,12 @@ impl Drop for App {
 
 fn main() -> eframe::Result {
     let opts = eframe::NativeOptions {
+        // Wry child webviews require X11. Wayland desktops use XWayland.
+        #[cfg(target_os = "linux")]
+        event_loop_builder: Some(Box::new(|builder| {
+            use winit::platform::x11::EventLoopBuilderExtX11;
+            builder.with_x11();
+        })),
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1180.0, 760.0])
             .with_min_inner_size([900.0, 560.0])
@@ -1265,6 +1386,21 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_survives_tab_switch() {
+        let (mut saved, mut query, mut results) = (Searches::default(), "atm 10".to_string(), Results::default());
+        *results.lock().unwrap() = Some(Ok(vec![]));
+        let atm = results.clone();
+        switch_search(&mut saved, Source::CurseForge, Source::Modrinth, &mut query, &mut results);
+        assert!(query.is_empty() && results.lock().unwrap().is_none(), "Modrinth starts empty");
+        query = "create".into();
+        switch_search(&mut saved, Source::Modrinth, Source::CurseForge, &mut query, &mut results);
+        assert_eq!(query, "atm 10");
+        assert!(Arc::ptr_eq(&results, &atm), "same results, including a search still running");
+        switch_search(&mut saved, Source::CurseForge, Source::Modrinth, &mut query, &mut results);
+        assert_eq!(query, "create");
+    }
 
     #[test]
     fn file_names() {
@@ -1353,6 +1489,19 @@ mod tests {
         d.world = Some(data.join("My World"));
         app.new = Some(d);
         (0..3).for_each(|_| frame(&mut app));
+        for source in [Source::Pack, Source::Modrinth, Source::CurseForge, Source::Technic, Source::ATLauncher] {
+            let mut d = NewDialog::new();
+            d.src = source;
+            d.results = Arc::new(Mutex::new(Some(Ok(vec![sources::Hit {
+                title: "Test pack".into(),
+                slug: "test-pack".into(),
+                description: "Test description".into(),
+                downloads: 123,
+                icon_url: String::new(),
+            }]))));
+            app.new = Some(d);
+            (0..3).for_each(|_| frame(&mut app));
+        }
         std::fs::remove_dir_all(&data).unwrap();
     }
 

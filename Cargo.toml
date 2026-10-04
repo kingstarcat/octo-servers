@@ -1,6 +1,6 @@
 [package]
 name = "octo-servers"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Desktop app for hosting Minecraft servers, with modpack import, Java setup and playit.gg tunnels."
 
@@ -16,6 +16,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha1_smol = "1.0.1"
 ureq = { version = "3.4.2", features = ["json"] }
+wry = "0.57.0"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [[bin]]
@@ -24,3 +25,8 @@ path = "src/main.rs"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18.2"
+webkit2gtk = "=2.0.2"
+winit = "0.30.13"

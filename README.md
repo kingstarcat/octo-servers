@@ -6,7 +6,7 @@ It can create Vanilla, Paper, Fabric, Forge and NeoForge servers. If the right J
 
 You can also start from a world you played in singleplayer. Octo looks for worlds in the Minecraft launcher, CurseForge, Prism Launcher, MultiMC, PolyMC, Modrinth, ATLauncher, GDLauncher, the FTB app and Technic, or you can pick a folder or zip yourself. If the world comes from a modded instance, the server gets the same loader and version, the instance's mods and configs, and moves client-only mods (like Sodium, Iris or minimaps) to a mods-client-only folder. Then it starts the server once to check the mods load: a mod that crashes it with client-only code is moved aside too, and a left-out mod that another mod needs is put back.
 
-You can also start from a modpack. Search Modrinth from inside the app, paste a CurseForge or Modrinth link, or pick a server pack you already downloaded (a zip or an unzipped folder). For CurseForge packs it uses the pack's server files when the author provides them. The loader and Minecraft version are worked out from the pack.
+You can also start from a modpack. Search Modrinth, Technic or ATLauncher or browse CurseForge from inside the app, paste a CurseForge, Modrinth, Technic or ATLauncher link, or pick a server pack you already downloaded (a zip or an unzipped folder). For CurseForge packs it uses the pack's server files when the author provides them. The loader and Minecraft version are worked out from the pack.
 
 Each server has a dashboard, a console, a players tab (ops, whitelist, bans), a settings tab for server.properties, and a mods or plugins tab. The world is backed up before each start, and the last 5 automatic backups are kept. You can import an existing world from a folder or a zip, such as a singleplayer save, a downloaded map or one of the backups. The playit.gg tunnel lets friends join without port forwarding.
 
@@ -20,7 +20,11 @@ No API keys are needed. CurseForge projects are looked up through cfwidget, and 
 
 This builds the app, copies it to `~/.local/bin/octo` and adds Octo Servers to your app menu.
 
+The New server dialog has separate Custom, Import, World, Modrinth and CurseForge options. Choose a provider, search, and select a modpack from Octo's result list. The Mods tab also lets you choose Modrinth or CurseForge. CurseForge searches run in a hidden native browser using normal JavaScript and a persistent cookie profile; the website isn't displayed. If browser verification blocks a search, Octo reports the failure and you can paste a project link instead.
+
 ## Build
+
+The browser uses WebKitGTK on Linux and WebView2 on Windows. Linux needs GTK 3 and WebKitGTK 4.1 development packages (`libwebkit2gtk-4.1-dev` on Debian/Ubuntu, `webkit2gtk-4.1` on Arch). Octo uses X11, including XWayland on Wayland desktops. Windows needs the Microsoft Edge WebView2 Runtime.
 
 ```sh
 cargo build --release

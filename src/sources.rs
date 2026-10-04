@@ -238,6 +238,27 @@ pub struct CfLink {
     file: Option<u64>,
 }
 
+/// curseforge.com search page for `class` ("mc-mods", "modpacks", "bukkit-plugins"), filtered to
+/// the version and loader when given. For the user's browser: the site's search only answers
+/// real browsers.
+pub fn cf_search_url(query: &str, class: &str, mc: Option<&str>, f: Option<Flavor>) -> String {
+    let mut u = format!("https://www.curseforge.com/minecraft/search?class={class}&sortBy=relevancy&search={}", enc(query.trim()));
+    if let Some(mc) = mc {
+        u += &format!("&version={}", enc(mc));
+    }
+    // CurseForge's loader ids
+    let loader = match f {
+        Some(Flavor::Forge) => Some(1),
+        Some(Flavor::Fabric) => Some(4),
+        Some(Flavor::NeoForge) => Some(6),
+        _ => None,
+    };
+    if let Some(id) = loader {
+        u += &format!("&gameVersionTypeId={id}");
+    }
+    u
+}
+
 /// `https://www.curseforge.com/minecraft/<class>/<slug>[/files/<id>|/download/<id>]`
 pub fn parse_cf(link: &str) -> Option<CfLink> {
     let rest = link.split("curseforge.com/minecraft/").nth(1)?;
@@ -276,8 +297,6 @@ fn cf_files(pid: u64, done: impl Fn(&[Value]) -> bool) -> Result<Vec<Value>, Str
     Ok(all)
 }
 
-/// CurseForge redirects downloads to edge.forgecdn.net, which 404s for many files;
-/// mediafilez.forgecdn.net serves the same paths.
 /// CurseForge tags each file with the sides it runs on; "Client" without "Server" = client-only.
 /// Untagged files (or a failed lookup) count as not client-only.
 pub fn cf_client_only(pid: u64, fid: u64) -> bool {
@@ -288,12 +307,18 @@ pub fn cf_client_only(pid: u64, fid: u64) -> bool {
     })
 }
 
+/// CurseForge redirects downloads to edge.forgecdn.net, which 404s for many files;
+/// mediafilez.forgecdn.net serves the same paths.
+pub fn mediafilez(url: &str) -> String {
+    url.replace("://edge.forgecdn.net/", "://mediafilez.forgecdn.net/")
+}
+
 pub fn cf_download_url(pid: u64, fid: u64) -> Result<String, String> {
     let agent: ureq::Agent =
         ureq::Agent::config_builder().max_redirects(0).max_redirects_will_error(false).http_status_as_error(false).build().into();
     let r = agent.get(format!("{CF}/{pid}/files/{fid}/download")).header("User-Agent", UA).call().map_err(s)?;
     let loc = r.headers().get("location").and_then(|v| v.to_str().ok()).ok_or(format!("CurseForge file {fid} not downloadable"))?;
-    Ok(loc.split('?').next().unwrap_or(loc).replace("://edge.forgecdn.net/", "://mediafilez.forgecdn.net/"))
+    Ok(mediafilez(loc.split('?').next().unwrap_or(loc)))
 }
 
 fn cf_matches(file: &Value, mc: &str, f: Flavor) -> bool {
@@ -353,6 +378,98 @@ pub fn cf_modpack(l: &CfLink, to: &Path, log: &Log) -> Result<Option<(Flavor, St
     Ok(flavor.zip(mc.map(|m| m.to_string())))
 }
 
+// ---------- Technic and ATLauncher (public, keyless; modpacks only) ----------
+
+// Technic's API wants the launcher build in build=; any recent number works
+const TECHNIC: &str = "https://api.technicpack.net";
+const ATL: &str = "https://api.atlauncher.com/v1";
+/// ATLauncher's CDN; pack files are listed relative to it.
+pub const ATL_CDN: &str = "https://download.nodecdn.net/containers/atl";
+
+/// Technic search. Hits link to the pack page; Technic's search has no descriptions or counts.
+pub fn technic_search(query: &str) -> Result<Vec<Hit>, String> {
+    let r = get_json(&format!("{TECHNIC}/search?build=999&q={}", enc(query)))?;
+    Ok(r["modpacks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| {
+            Some(Hit {
+                title: m["name"].as_str()?.into(),
+                slug: format!("https://www.technicpack.net/modpack/{}", m["slug"].as_str()?),
+                description: String::new(),
+                downloads: 0,
+                icon_url: m["iconUrl"].as_str().unwrap_or("").into(),
+            })
+        })
+        .collect())
+}
+
+/// `https://www.technicpack.net/modpack/<slug>[.<id>]`
+pub fn parse_technic(link: &str) -> Option<String> {
+    let seg = link.split("technicpack.net/modpack/").nth(1)?.split(['/', '?', '#']).next()?;
+    let slug = match seg.rsplit_once('.') {
+        Some((slug, id)) if id.chars().all(|c| c.is_ascii_digit()) => slug,
+        _ => seg,
+    };
+    (!slug.is_empty()).then(|| slug.to_string())
+}
+
+/// The Technic pack's server files. Community packs often only have the client pack.
+pub fn technic_server_zip(slug: &str) -> Result<String, String> {
+    let m = get_json(&format!("{TECHNIC}/modpack/{}?build=999", enc(slug)))?;
+    let name = m["displayName"].as_str().unwrap_or(slug);
+    m["serverPackUrl"]
+        .as_str()
+        .filter(|u| !u.is_empty())
+        .map(String::from)
+        .ok_or(format!("{name} has no server files on Technic. Download its server pack from the pack's website, then use Import."))
+}
+
+/// ATLauncher's public packs whose name has every word of `query`, most recently updated first.
+pub fn atl_search(query: &str) -> Result<Vec<Hit>, String> {
+    let r = get_json(&format!("{ATL}/packs/full/public"))?;
+    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    let mut packs: Vec<&Value> = r["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|p| {
+            let name = p["name"].as_str().unwrap_or("").to_lowercase();
+            words.iter().all(|w| name.contains(w.as_str()))
+        })
+        .collect();
+    let updated = |p: &Value| p["versions"].as_array().into_iter().flatten().filter_map(|v| v["published"].as_u64()).max();
+    packs.sort_by_key(|p| std::cmp::Reverse(updated(p)));
+    Ok(packs
+        .into_iter()
+        .filter_map(|p| {
+            let safe = p["safeName"].as_str()?;
+            let desc = p["description"].as_str().unwrap_or("").lines().next().unwrap_or("");
+            Some(Hit {
+                title: p["name"].as_str()?.into(),
+                slug: format!("https://atlauncher.com/pack/{safe}"),
+                description: if desc.chars().count() > 160 { desc.chars().take(160).collect::<String>() + "..." } else { desc.into() },
+                downloads: 0,
+                icon_url: format!("https://cdn.atlcdn.net/images/packs/{}.png", safe.to_lowercase()),
+            })
+        })
+        .collect())
+}
+
+/// `https://atlauncher.com/pack/<safeName>`
+pub fn parse_atl(link: &str) -> Option<String> {
+    link.split("atlauncher.com/pack/").nth(1)?.split(['/', '?', '#']).next().filter(|s| !s.is_empty()).map(String::from)
+}
+
+/// Latest version of an ATLauncher pack and its install config (mods, loader, Minecraft version).
+pub fn atl_config(safe: &str) -> Result<(String, Value), String> {
+    let pack = get_json(&format!("{ATL}/pack/{}", enc(safe)))?;
+    let ver = pack["data"]["versions"][0]["version"].as_str().ok_or(format!("ATLauncher pack {safe} has no versions"))?.to_string();
+    let config = get_json(&format!("{ATL_CDN}/packs/{}/versions/{}/Configs.json", enc(safe), enc(&ver)))?;
+    Ok((ver, config))
+}
+
 /// Add a mod/plugin from a CurseForge or Modrinth link, a Modrinth slug, or a direct .jar URL.
 pub fn add_mod(src: &str, mc: &str, f: Flavor, server_dir: &Path, log: &Log) -> Result<(), String> {
     let dest: PathBuf = server_dir.join(content_dir(f));
@@ -403,5 +520,14 @@ mod tests {
         assert_eq!(parse_modrinth("https://modrinth.com/modpack/adrenaserver"), Some(("adrenaserver".into(), None)));
         assert_eq!(parse_modrinth("https://modrinth.com/mod/sodium/version/abc"), Some(("sodium".into(), Some("abc".into()))));
         assert!(parse_cf("https://modrinth.com/mod/x").is_none());
+        assert_eq!(
+            cf_search_url("just enough", "mc-mods", Some("1.21.1"), Some(Flavor::NeoForge)),
+            "https://www.curseforge.com/minecraft/search?class=mc-mods&sortBy=relevancy&search=just%20enough&version=1.21.1&gameVersionTypeId=6"
+        );
+        assert!(!cf_search_url("", "bukkit-plugins", None, Some(Flavor::Paper)).contains("gameVersionTypeId"));
+        assert_eq!(parse_technic("https://www.technicpack.net/modpack/tekkit.552560"), Some("tekkit".into()));
+        assert_eq!(parse_technic("https://www.technicpack.net/modpack/hexxit"), Some("hexxit".into()));
+        assert_eq!(parse_atl("https://atlauncher.com/pack/AllTheForge10?x=1"), Some("AllTheForge10".into()));
+        assert!(parse_technic("https://modrinth.com/mod/x").is_none() && parse_atl("https://modrinth.com/mod/x").is_none());
     }
 }

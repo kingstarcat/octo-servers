@@ -10,12 +10,23 @@ pub type Detected = (Flavor, String, Option<String>);
 /// `over` = type + MC version the user picked manually (wins over detection).
 pub fn import(src: &str, dir: &Path, over: Option<(Flavor, String)>, log: &Log) -> Result<Detected, String> {
     let src = src.trim().trim_matches('"');
+    if let Some(safe) = sources::parse_atl(src) {
+        let (f, mc, loader) = atl_pack(&safe, dir, log)?;
+        return Ok(match over {
+            Some((of, omc)) if (of, omc.as_str()) != (f, mc.as_str()) => (of, omc, None),
+            _ => (f, mc, loader),
+        });
+    }
     let zip = dir.join("_download.zip");
     let mut hint = None;
     if let Some(l) = sources::parse_cf(src) {
         hint = sources::cf_modpack(&l, &zip, log)?;
     } else if let Some((slug, ver)) = sources::parse_modrinth(src) {
         sources::modrinth_modpack(&slug, ver.as_deref(), &zip, log)?;
+    } else if let Some(slug) = sources::parse_technic(src) {
+        let url = sources::technic_server_zip(&slug)?;
+        push(log, format!("Downloading {url}"));
+        crate::download(&url, &zip)?;
     } else if src.starts_with("http://") || src.starts_with("https://") {
         push(log, format!("Downloading {src}"));
         crate::download(src, &zip)?;
@@ -241,6 +252,74 @@ fn mrpack(dir: &Path, log: &Log) -> Result<Detected, String> {
     Ok((flavor, mc, loader))
 }
 
+/// ATLauncher pack: the latest version's server-side mods and its configs. ATLauncher has no
+/// server packs, but its config marks each mod client and/or server.
+fn atl_pack(safe: &str, dir: &Path, log: &Log) -> Result<Detected, String> {
+    let (ver, c) = sources::atl_config(safe)?;
+    push(log, format!("ATLauncher pack {safe} {ver}"));
+    let mc = c["minecraft"].as_str().ok_or("the pack has no Minecraft version")?.to_string();
+    let (flavor, loader) = match c["loader"]["type"].as_str() {
+        Some(t) => {
+            (flavor_from(t).ok_or(format!("{t} modpacks aren't supported"))?, c["loader"]["metadata"]["version"].as_str().map(String::from))
+        }
+        None => (Flavor::Vanilla, None),
+    };
+    let jobs = atl_jobs(&c, &mc, dir, log)?;
+    push(log, format!("Downloading {} server-side files...", jobs.len()));
+    finish_downloads(download_all(jobs, log), log);
+    if c["noConfigs"] != true {
+        push(log, "Downloading configs...");
+        let zip = dir.join("_configs.zip");
+        let base = format!("{}/packs/{}/versions/{}", sources::ATL_CDN, crate::enc(safe), crate::enc(&ver));
+        crate::download(&format!("{base}/Configs.zip"), &zip)?;
+        extract(&zip, dir, log)?;
+        std::fs::remove_file(&zip).map_err(s)?;
+    }
+    Ok((flavor, mc, loader))
+}
+
+/// Where each server-side mod in an ATLauncher config comes from and goes to. Optional mods are
+/// included when the pack recommends them, like ATLauncher's own install.
+fn atl_jobs(c: &Value, mc: &str, dir: &Path, log: &Log) -> Result<Vec<(String, PathBuf)>, String> {
+    let mut jobs = vec![];
+    for m in c["mods"].as_array().into_iter().flatten() {
+        let name = m["name"].as_str().unwrap_or("?");
+        if m["server"] == false || (m["optional"] == true && m["recommended"] != true) {
+            continue;
+        }
+        let sub = match m["type"].as_str().unwrap_or("mods") {
+            "mods" => "mods".to_string(),
+            t @ ("coremods" | "plugins") => t.to_string(),
+            "dependency" => format!("mods/{mc}"),
+            "resourcepack" | "texturepack" | "shaderpack" => continue,
+            other => {
+                push(log, format!("WARN skipped {name}: Octo can't install {other} files"));
+                continue;
+            }
+        };
+        let file = m["file"].as_str().unwrap_or(name);
+        let ids = (m["curse_id"].as_u64(), m["curse_file_id"].as_u64());
+        let url = match (m["download"].as_str(), m["url"].as_str(), ids) {
+            (Some("server"), Some(u), _) => format!("{}/{}", sources::ATL_CDN, u.split('/').map(crate::enc).collect::<Vec<_>>().join("/")),
+            (Some("direct"), Some(u), _) => sources::mediafilez(u),
+            (_, _, (Some(p), Some(f))) => match sources::cf_download_url(p, f) {
+                Ok(u) => u,
+                Err(e) => {
+                    push(log, format!("WARN {name}: {e}"));
+                    continue;
+                }
+            },
+            _ => {
+                push(log, format!("WARN {name} has to be downloaded by hand: {}", m["website"].as_str().unwrap_or("")));
+                continue;
+            }
+        };
+        let to = safe_join(dir, &format!("{sub}/{file}")).ok_or(format!("modpack has an unsafe path: {file}"))?;
+        jobs.push((url, to));
+    }
+    Ok(jobs)
+}
+
 fn cf_manifest(dir: &Path) -> Option<Value> {
     let m: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).ok()?).ok()?;
     (m["manifestType"] == "minecraftModpack").then_some(m)
@@ -409,6 +488,50 @@ mod tests {
         std::fs::create_dir_all(mods_only.join("mods")).unwrap();
         assert_eq!(server_root(&mods_only), mods_only);
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn atl_picks_server_files() {
+        let c: Value = serde_json::from_str(
+            r#"{"mods":[
+            {"name":"Create","file":"create.jar","type":"mods","download":"server","url":"packs/P/files/[1.21] create v1.jar","server":true},
+            {"name":"Iris","file":"iris.jar","type":"mods","download":"server","url":"packs/P/files/iris.jar","client":true,"server":false},
+            {"name":"Extra","file":"extra.jar","type":"mods","download":"direct","url":"https://edge.forgecdn.net/files/1/2/extra.jar","optional":true,"recommended":true},
+            {"name":"Skipped","file":"skip.jar","type":"mods","download":"direct","url":"https://x/skip.jar","optional":true},
+            {"name":"Lib","file":"lib.jar","type":"dependency","download":"direct","url":"https://x/lib.jar"},
+            {"name":"Pack","file":"faithful.zip","type":"resourcepack","download":"direct","url":"https://x/f.zip"},
+            {"name":"Manual","file":"m.jar","type":"mods","download":"browser","website":"https://example.com/m"}
+        ]}"#,
+        )
+        .unwrap();
+        let (d, log) = (Path::new("/srv/s"), Log::default());
+        let jobs = atl_jobs(&c, "1.12.2", d, &log).unwrap();
+        assert_eq!(
+            jobs,
+            [
+                (format!("{}/packs/P/files/%5B1.21%5D%20create%20v1.jar", sources::ATL_CDN), d.join("mods/create.jar")),
+                ("https://mediafilez.forgecdn.net/files/1/2/extra.jar".into(), d.join("mods/extra.jar")),
+                ("https://x/lib.jar".into(), d.join("mods/1.12.2/lib.jar")),
+            ]
+        );
+        assert!(log.lock().unwrap().iter().any(|l| l.contains("Manual has to be downloaded by hand: https://example.com/m")));
+    }
+
+    /// cargo test live_technic_atl -- --ignored
+    #[test]
+    #[ignore]
+    fn live_technic_atl() {
+        assert!(sources::technic_search("tekkit").unwrap().iter().any(|h| h.slug.ends_with("/tekkit")));
+        assert!(sources::technic_server_zip("tekkit").unwrap().ends_with(".zip"));
+        let hits = sources::atl_search("all the forge").unwrap();
+        let safe = hits.iter().find_map(|h| sources::parse_atl(&h.slug)).unwrap();
+        let (_, c) = sources::atl_config(&safe).unwrap();
+        let jobs = atl_jobs(&c, c["minecraft"].as_str().unwrap(), Path::new("/srv/s"), &Log::default()).unwrap();
+        assert!(jobs.len() > 50, "{safe}: {} jobs", jobs.len());
+        let probe = std::env::temp_dir().join(format!("octo-atl-{}.jar", std::process::id()));
+        crate::download(&jobs[0].0, &probe).unwrap();
+        assert!(std::fs::metadata(&probe).unwrap().len() > 0);
+        std::fs::remove_file(probe).unwrap();
     }
 
     #[test]

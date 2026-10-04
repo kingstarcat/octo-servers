@@ -229,7 +229,8 @@ fn adds_content(jar: &Path) -> bool {
 }
 
 /// CurseForge (project, file) ids by jar name, from what the launcher recorded: Prism's
-/// `mods/.index/*.pw.toml` and the CurseForge app's `minecraftinstance.json`.
+/// `mods/.index/*.pw.toml`, the CurseForge app's `minecraftinstance.json`, ATLauncher's
+/// `instance.json` and GDLauncher's `config.json`.
 fn cf_ids(mods: &Path) -> std::collections::HashMap<String, (u64, u64)> {
     let mut ids = std::collections::HashMap::new();
     for f in std::fs::read_dir(mods.join(".index")).into_iter().flatten().flatten() {
@@ -245,11 +246,19 @@ fn cf_ids(mods: &Path) -> std::collections::HashMap<String, (u64, u64)> {
             ids.insert(name, (p, id));
         }
     }
-    if let Some(m) = mods.parent().and_then(|g| json(&g.join("minecraftinstance.json"))) {
-        for a in m["installedAddons"].as_array().into_iter().flatten() {
-            let f = &a["installedFile"];
-            if let (Some(p), Some(id), Some(name)) = (a["addonID"].as_u64(), f["id"].as_u64(), f["fileName"].as_str()) {
-                ids.insert(name.to_string(), (p, id));
+    // (file, mod list, jar name, project id, file id)
+    for (file, list, name, p, id) in [
+        ("minecraftinstance.json", "/installedAddons", "/installedFile/fileName", "/addonID", "/installedFile/id"),
+        ("instance.json", "/launcher/mods", "/file", "/curseForgeProjectId", "/curseForgeFileId"), // ATLauncher
+        ("config.json", "/mods", "/fileName", "/projectID", "/fileID"),                            // GDLauncher
+    ] {
+        let Some(m) = mods.parent().and_then(|g| json(&g.join(file))) else { continue };
+        for a in m.pointer(list).and_then(Value::as_array).into_iter().flatten() {
+            let get = |k: &str| a.pointer(k);
+            if let (Some(n), Some(p), Some(id)) =
+                (get(name).and_then(Value::as_str), get(p).and_then(Value::as_u64), get(id).and_then(Value::as_u64))
+            {
+                ids.insert(n.to_string(), (p, id));
             }
         }
     }
@@ -661,9 +670,18 @@ mod tests {
             r#"{"installedAddons":[{"addonID":238222,"installedFile":{"id":5101366,"fileName":"jei.jar"}}]}"#,
         )
         .unwrap();
+        std::fs::write(
+            d.join("instance.json"),
+            r#"{"launcher":{"mods":[{"file":"create.jar","curseForgeProjectId":328085,"curseForgeFileId":5838779},{"file":"local.jar"}]}}"#,
+        )
+        .unwrap();
+        std::fs::write(d.join("config.json"), r#"{"mods":[{"fileName":"sodium.jar","projectID":394468,"fileID":5217345}]}"#).unwrap();
         let ids = cf_ids(&d.join("mods"));
         assert_eq!(ids.get("biomemusic-1.21.1-4.1.jar"), Some(&(401234, 6012345)));
         assert_eq!(ids.get("jei.jar"), Some(&(238222, 5101366)));
+        assert_eq!(ids.get("create.jar"), Some(&(328085, 5838779)));
+        assert_eq!(ids.get("sodium.jar"), Some(&(394468, 5217345)));
+        assert_eq!(ids.get("local.jar"), None);
         std::fs::remove_dir_all(&d).unwrap();
     }
 
