@@ -1493,7 +1493,44 @@ impl Drop for App {
     }
 }
 
+/// Save what went wrong to `<data dir>/crash.txt` (release builds have no console on Windows,
+/// so there's nowhere else to see it) and, if the app itself is going down, say where it is.
+fn report_crash(what: &str, fatal: bool) {
+    let path = data_dir().join("crash.txt");
+    let text = format!(
+        "Octo Servers {} on {} {}\n{what}\n\n{}\n",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        std::backtrace::Backtrace::force_capture()
+    );
+    let _ = std::fs::create_dir_all(data_dir());
+    let saved = std::fs::write(&path, text).is_ok();
+    if fatal {
+        let where_ = if saved { format!("The details were saved to {}.", path.display()) } else { what.to_string() };
+        rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Error)
+            .set_title("Octo Servers crashed")
+            .set_description(format!("Octo Servers ran into a problem and has to close. {where_} Send that file to whoever gave you Octo."))
+            .show();
+    }
+}
+
 fn main() -> eframe::Result {
+    std::panic::set_hook(Box::new(|info| {
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or("unnamed");
+        // background tasks report their own panics ("task panicked"); only the main thread takes the app down
+        report_crash(&format!("panic on thread {name}: {info}"), name == "main");
+    }));
+    let r = run();
+    if let Err(e) = &r {
+        report_crash(&format!("couldn't start: {e}"), true);
+    }
+    r
+}
+
+fn run() -> eframe::Result {
     let opts = eframe::NativeOptions {
         // Wry child webviews require X11. Wayland desktops use XWayland.
         #[cfg(target_os = "linux")]
