@@ -115,6 +115,7 @@ fn run(log: &Log, cancel: &AtomicBool) -> Result<(Child, String), String> {
 /// so nobody has to set it up on playit.gg by hand.
 fn watch_tunnel(secret: &str, tunnel: &Mutex<Tunnel>, cancel: &AtomicBool, log: &Log) {
     let mut tried_create = false;
+    let mut early_retries = 20;
     // kept so a failed create stays on screen instead of being replaced by "waiting"
     let mut create_error: Option<String> = None;
     while !cancel.load(Ordering::SeqCst) {
@@ -129,6 +130,12 @@ fn watch_tunnel(secret: &str, tunnel: &Mutex<Tunnel>, cancel: &AtomicBool, log: 
                     push(log, "Creating a Minecraft tunnel on playit.gg.");
                     match create_tunnel(secret, r["data"]["agent_id"].as_str().unwrap_or("")) {
                         Ok(()) => Tunnel::Waiting("Creating the tunnel...".into()),
+                        // playit answers this until the fresh agent has reported its version; ask again
+                        Err(e) if e.contains("AgentVersionTooOld") && early_retries > 0 => {
+                            early_retries -= 1;
+                            tried_create = false;
+                            Tunnel::Waiting("Waiting for the playit.gg agent to connect...".into())
+                        }
                         Err(e) => {
                             push(log, format!("ERROR: {e}"));
                             create_error = Some(e.clone());
