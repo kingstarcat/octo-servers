@@ -7,8 +7,14 @@ use std::path::{Component, Path, PathBuf};
 
 pub type Detected = (Flavor, String, Option<String>);
 
+/// Error `import` gives for a client launcher instance when `clean` is off; the GUI then asks
+/// whether to clean it.
+pub const CLIENT_PACK: &str = "This is the client (launcher) version of the pack, not server files. \
+    Download the pack's server version instead; it usually has Server in the file name.";
+
 /// `over` = type + MC version the user picked manually (wins over detection).
-pub fn import(src: &str, dir: &Path, over: Option<(Flavor, String)>, log: &Log) -> Result<Detected, String> {
+/// `clean` = import a client launcher instance, leaving out its client-only mods.
+pub fn import(src: &str, dir: &Path, over: Option<(Flavor, String)>, clean: bool, log: &Log) -> Result<Detected, String> {
     let src = src.trim().trim_matches('"');
     if let Some(safe) = sources::parse_atl(src) {
         let (f, mc, loader) = atl_pack(&safe, dir, log)?;
@@ -45,13 +51,13 @@ pub fn import(src: &str, dir: &Path, over: Option<(Flavor, String)>, log: &Log) 
     }
 
     // A launcher instance (MultiMC / Prism / ATLauncher export) is the *client* pack: it has
-    // client-only mods and no server files, so even a manual Type pick would give a broken server.
-    if ["mmc-pack.json", "instance.cfg", "instance.json"].iter().any(|f| dir.join(f).exists()) {
-        return Err("This is the client (launcher) version of the pack, not server files. \
-            Download the pack's server version instead; it usually has Server in the file name."
-            .into());
-    }
-    let detected = if dir.join("modrinth.index.json").exists() {
+    // client-only mods and no server files, so only import it once the user agrees to clean it.
+    let detected = if ["mmc-pack.json", "instance.cfg", "instance.json"].iter().any(|f| dir.join(f).exists()) {
+        if !clean {
+            return Err(CLIENT_PACK.into());
+        }
+        Some(crate::worlds::clean_instance(dir, log)?)
+    } else if dir.join("modrinth.index.json").exists() {
         Some(mrpack(dir, log)?)
     } else if let Some(m) = cf_manifest(dir) {
         Some(cf_client_pack(dir, &m, log)?)
@@ -580,7 +586,7 @@ mod e2e {
             let dir = root.join(name);
             std::fs::create_dir_all(&dir).unwrap();
             let log = Log::default();
-            let r = import(src, &dir, None, &log);
+            let r = import(src, &dir, None, false, &log);
             let mods = std::fs::read_dir(dir.join("mods")).map(|d| d.count()).unwrap_or(0);
             println!("{name}: {r:?} mods={mods}");
             if let Ok((f, mc, l)) = &r {
@@ -621,7 +627,7 @@ mod e2e_local {
     fn e2e_local_pack() {
         let src = std::env::var("E2E_PACK").unwrap();
         let log = Log::default();
-        let r = crate::server::create_with("e2e", 4096, &log, |dir, log| import(&src, dir, None, log));
+        let r = crate::server::create_with("e2e", 4096, &log, |dir, log| import(&src, dir, None, false, log));
         for l in log.lock().unwrap().iter().filter(|l| !l.starts_with('[')) {
             println!("  {l}");
         }

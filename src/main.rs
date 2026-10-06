@@ -400,6 +400,15 @@ impl NewDialog {
     }
 }
 
+/// Right-click menu on a server in the list.
+enum Menu {
+    Delete,
+    Export,
+    Rename,
+}
+
+type PackJob = (String, u32, String, Option<(Flavor, String)>);
+
 struct App {
     servers: Vec<Server>,
     sel: usize,
@@ -426,8 +435,15 @@ struct App {
     /// start this server once the running task (the pre-start backup) succeeds
     start_after: Option<String>,
     confirm_delete: Option<String>,
+    confirm_delete_world: Option<String>,
+    /// server being renamed, and the new name being typed
+    rename: Option<(String, String)>,
     /// server name, and the worlds found on this PC
     confirm_import: Option<(String, Vec<worlds::Found>)>,
+    /// the last modpack import (name, RAM, source, manual type), to rerun it cleaned
+    pack_job: Option<PackJob>,
+    /// the pack turned out to be a client pack; ask whether to clean it
+    ask_clean: bool,
     /// a newer Octo release (filled by the startup check), and whether it's been installed
     update: Arc<Mutex<Option<update::Release>>>,
     update_dismissed: bool,
@@ -463,7 +479,11 @@ impl App {
             show_settings: false,
             start_after: None,
             confirm_delete: None,
+            confirm_delete_world: None,
+            rename: None,
             confirm_import: None,
+            pack_job: None,
+            ask_clean: false,
             update: Default::default(),
             update_dismissed: false,
             updated_exe: Default::default(),
@@ -527,6 +547,7 @@ impl App {
                         self.start_now(i);
                     }
                 }
+                Err(e) if e == packs::CLIENT_PACK && self.pack_job.is_some() => self.ask_clean = true,
                 Err(e) => {
                     push(&t.log, format!("ERROR: {e}"));
                     self.error = Some(format!("{}: {e}", t.label));
@@ -600,10 +621,35 @@ impl eframe::App for App {
             ui.add_space(6.0);
             ui.weak("YOUR SERVERS");
             egui::ScrollArea::vertical().max_height((ui.available_height() - 170.0).max(80.0)).show(ui, |ui| {
+                let busy = self.task.is_some();
+                let mut menu = None;
                 for (i, s) in self.servers.iter_mut().enumerate() {
-                    if dashboard::server_entry(ui, s, self.sel == i) {
+                    let r = dashboard::server_entry(ui, s, self.sel == i);
+                    if r.clicked() {
                         self.sel = i;
                     }
+                    let running = s.running();
+                    r.context_menu(|ui| {
+                        let stopped = !running && !busy;
+                        for (label, item) in [("Delete", Menu::Delete), ("Export", Menu::Export), ("Rename", Menu::Rename)] {
+                            let b = ui.add_enabled(stopped, egui::Button::new(label));
+                            if b.clicked() {
+                                menu = Some((s.name.clone(), s.dir.clone(), item));
+                            }
+                            b.on_disabled_hover_text(if running { "Stop the server first" } else { "Wait for the current task" });
+                        }
+                    });
+                }
+                match menu {
+                    Some((name, _, Menu::Delete)) => self.confirm_delete = Some(name),
+                    Some((name, _, Menu::Rename)) => self.rename = Some((name.clone(), name)),
+                    Some((name, dir, Menu::Export)) => {
+                        let file = rfd::FileDialog::new().add_filter("Zip", &["zip"]).set_file_name(format!("{name}.zip")).save_file();
+                        if let Some(out) = file {
+                            self.run_task(format!("Exporting {name}"), move |log| server::export(&dir, &out, log));
+                        }
+                    }
+                    None => {}
                 }
             });
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
@@ -719,8 +765,7 @@ impl eframe::App for App {
                     if self.props.as_ref().is_none_or(|p| p.dir != srv.dir) {
                         self.props = Some(dashboard::Props::load(&srv.dir));
                     }
-                    dashboard::settings(ui, self.props.as_mut().unwrap(), running);
-                    None
+                    dashboard::settings(ui, self.props.as_mut().unwrap(), running, busy)
                 }
                 Tab::Mods => {
                     self.mods_ui(ui, busy, running);
@@ -764,6 +809,7 @@ impl eframe::App for App {
                 }
                 Some(Act::ImportWorld) => self.confirm_import = Some((self.servers[self.sel].name.clone(), worlds::scan())),
                 Some(Act::Delete) => self.confirm_delete = Some(self.servers[self.sel].name.clone()),
+                Some(Act::DeleteWorld) => self.confirm_delete_world = Some(self.servers[self.sel].name.clone()),
                 None => {}
             }
         });
@@ -773,6 +819,9 @@ impl eframe::App for App {
         self.settings_window(&ctx);
         self.delete_window(&ctx);
         self.import_window(&ctx);
+        self.delete_world_window(&ctx);
+        self.rename_window(&ctx);
+        self.clean_window(&ctx);
     }
 }
 
@@ -1122,11 +1171,9 @@ impl App {
                 return;
             }
             if d.src.is_pack() {
-                let (src, ram) = (d.link.trim().to_string(), d.ram_mb);
                 let over = d.over_flavor.map(|f| (f, d.over_mc.trim().to_string()));
-                self.run_task(format!("Importing {name}"), move |log| {
-                    server::create_with(&name, ram, log, |dir, log| packs::import(&src, dir, over, log))
-                });
+                self.pack_job = Some((name, d.ram_mb, d.link.trim().to_string(), over));
+                self.import_pack(false);
                 return;
             }
             let cfg = server::Config { flavor: d.flavor, mc_version: d.version, java_major: 0, ram_mb: d.ram_mb, launch: None };
@@ -1298,6 +1345,94 @@ impl App {
         }
         if delete || close {
             self.confirm_delete = None;
+        }
+    }
+
+    fn delete_world_window(&mut self, ctx: &egui::Context) {
+        let Some(name) = self.confirm_delete_world.clone() else { return };
+        let (mut close, mut delete) = (false, false);
+        egui::Window::new("Delete world").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(
+            ctx,
+            |ui| {
+                ui.label(format!("Delete the world of \"{name}\"?"));
+                ui.label("It is backed up first. The server makes a new world the next time it starts.");
+                ui.horizontal(|ui| {
+                    delete = ui.button(egui::RichText::new("Delete world").color(dashboard::RED)).clicked();
+                    close = ui.button("Cancel").clicked();
+                });
+            },
+        );
+        if delete && let Some(dir) = self.servers.iter().find(|s| s.name == name).map(|s| s.dir.clone()) {
+            self.run_task(format!("Deleting the world of {name}"), move |log| server::delete_world(&dir, log));
+        }
+        if delete || close {
+            self.confirm_delete_world = None;
+        }
+    }
+
+    fn rename_window(&mut self, ctx: &egui::Context) {
+        let Some((old, new)) = &mut self.rename else { return };
+        let (mut close, mut ok) = (false, false);
+        let err = if new.trim() == old.as_str() { Some("Enter a new name".to_string()) } else { server::validate_name(new).err() };
+        egui::Window::new("Rename server").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(
+            ctx,
+            |ui| {
+                let r = ui.text_edit_singleline(new);
+                if let Some(e) = &err {
+                    ui.weak(e);
+                }
+                ui.horizontal(|ui| {
+                    ok = ui.add_enabled(err.is_none(), egui::Button::new("Rename")).clicked()
+                        || (err.is_none() && r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                    close = ui.button("Cancel").clicked();
+                });
+            },
+        );
+        if ok && let Some(dir) = self.servers.iter().find(|s| &s.name == old).map(|s| s.dir.clone()) {
+            match server::rename(&dir, new) {
+                Ok(()) => {
+                    let new = new.trim().to_string();
+                    self.reload();
+                    if let Some(i) = self.servers.iter().position(|s| s.name == new) {
+                        self.sel = i;
+                    }
+                }
+                Err(e) => self.error = Some(e),
+            }
+        }
+        if ok || close {
+            self.rename = None;
+        }
+    }
+
+    fn import_pack(&mut self, clean: bool) {
+        let Some((name, ram, src, over)) = self.pack_job.clone() else { return };
+        self.run_task(format!("Importing {name}"), move |log| {
+            server::create_with(&name, ram, log, |dir, log| packs::import(&src, dir, over, clean, log))
+        });
+    }
+
+    fn clean_window(&mut self, ctx: &egui::Context) {
+        if !self.ask_clean {
+            return;
+        }
+        let (mut yes, mut no) = (false, false);
+        egui::Window::new("Client pack").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(
+            ctx,
+            |ui| {
+                ui.label("This is the client version of the pack. Attempt to clean and import?");
+                ui.horizontal(|ui| {
+                    yes = ui.button("Yes").clicked();
+                    no = ui.button("No").clicked();
+                });
+            },
+        );
+        if yes {
+            self.ask_clean = false;
+            self.import_pack(true);
+        } else if no {
+            self.ask_clean = false;
+            self.error = Some(packs::CLIENT_PACK.into());
         }
     }
 

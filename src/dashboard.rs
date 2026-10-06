@@ -26,6 +26,7 @@ pub enum Act {
     Backup,
     ImportWorld,
     Delete,
+    DeleteWorld,
 }
 
 /// Slider upper bound: the PC's RAM (rounded down to 512 MB), at least 4 GB, 16 GB if unknown.
@@ -90,7 +91,7 @@ pub fn open_folder(dir: &Path) {
 }
 
 /// One server in the sidebar. Returns true when clicked.
-pub fn server_entry(ui: &mut egui::Ui, srv: &mut Server, selected: bool) -> bool {
+pub fn server_entry(ui: &mut egui::Ui, srv: &mut Server, selected: bool) -> egui::Response {
     let running = srv.running();
     let (fill, stroke) = if selected { (GREEN.gamma_multiply(0.12), GREEN) } else { (ui.visuals().faint_bg_color, Color32::TRANSPARENT) };
     let frame = egui::Frame::new().fill(fill).stroke(Stroke::new(1.0, stroke)).corner_radius(10.0).inner_margin(10.0);
@@ -103,7 +104,7 @@ pub fn server_entry(ui: &mut egui::Ui, srv: &mut Server, selected: bool) -> bool
         ui.label(RichText::new(text).small().color(if running { GREEN } else { GRAY }));
     });
     ui.add_space(2.0);
-    r.response.interact(egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+    r.response.interact(egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// Server name, status and type above the tabs.
@@ -579,7 +580,8 @@ fn row(ui: &mut egui::Ui, label: &str, body: impl FnOnce(&mut egui::Ui)) {
     ui.end_row();
 }
 
-pub fn settings(ui: &mut egui::Ui, p: &mut Props, running: bool) {
+pub fn settings(ui: &mut egui::Ui, p: &mut Props, running: bool, busy: bool) -> Option<Act> {
+    let mut act = None;
     if p.vals == p.orig {
         // nothing edited: follow the file (the server writes it on first start)
         let msg = std::mem::take(&mut p.msg);
@@ -606,6 +608,12 @@ pub fn settings(ui: &mut egui::Ui, p: &mut Props, running: bool) {
                     row(ui, "Game mode", |ui| combo(ui, p, "gamemode", &["survival", "creative", "adventure", "spectator"]));
                 });
                 ui.weak("A new seed only applies to a newly generated world.");
+                let world = crate::server::has_world(&p.dir);
+                let r = ui.add_enabled(!running && !busy && world, egui::Button::new(RichText::new("Delete world").color(RED)));
+                if r.clicked() {
+                    act = Some(Act::DeleteWorld);
+                }
+                r.on_disabled_hover_text(if running { "Stop the server first" } else { "No world yet" });
             });
             section(&mut c[0], "Players & network", |ui| {
                 egui::Grid::new("net").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
@@ -653,6 +661,7 @@ pub fn settings(ui: &mut egui::Ui, p: &mut Props, running: bool) {
             ui.colored_label(ui.visuals().warn_fg_color, "The server is running: restart it to apply saved changes.");
         }
     });
+    act
 }
 
 #[cfg(test)]

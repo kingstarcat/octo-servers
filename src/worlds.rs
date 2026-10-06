@@ -538,19 +538,46 @@ pub fn import(src: &Path, dir: &Path, with_mods: bool, log: &Log) -> Result<Dete
         push(log, format!("WARN the world was last played on Minecraft {l}, but its instance is set to {mc}. Using {mc}."));
     }
     if let (Some(g), Some(m), true) = (game, &mods, flavor != Flavor::Vanilla) {
-        let left_out = copy_mods(m, dir, log)?;
-        if !left_out.is_empty() {
-            push(log, format!("Moved {} client-only mods to {CLIENT_ONLY}: {}", left_out.len(), left_out.join(", ")));
-        }
-        for extra in ["config", "defaultconfigs", "kubejs", "scripts"] {
-            if g.join(extra).is_dir() {
-                std::fs::create_dir_all(dir.join(extra)).map_err(s)?;
-                let n = crate::packs::copy_dir(&g.join(extra), &dir.join(extra))?;
-                push(log, format!("Copied {extra} ({n} files)"));
-            }
-        }
+        copy_instance(g, m, dir, log)?;
     }
     Ok((flavor, mc, loader))
+}
+
+/// Mods (minus client-only ones) and configs from instance game folder `g` into server `dir`.
+fn copy_instance(g: &Path, mods: &Path, dir: &Path, log: &Log) -> Result<(), String> {
+    let left_out = copy_mods(mods, dir, log)?;
+    if !left_out.is_empty() {
+        push(log, format!("Moved {} client-only mods to {CLIENT_ONLY}: {}", left_out.len(), left_out.join(", ")));
+    }
+    for extra in ["config", "defaultconfigs", "kubejs", "scripts"] {
+        if g.join(extra).is_dir() {
+            std::fs::create_dir_all(dir.join(extra)).map_err(s)?;
+            let n = crate::packs::copy_dir(&g.join(extra), &dir.join(extra))?;
+            push(log, format!("Copied {extra} ({n} files)"));
+        }
+    }
+    Ok(())
+}
+
+/// Turn a client launcher instance unpacked into `dir` (Prism / MultiMC / ATLauncher export)
+/// into server files: the instance's loader, its mods minus client-only ones, and its configs.
+pub fn clean_instance(dir: &Path, log: &Log) -> Result<Detected, String> {
+    let src = dir.join("_client");
+    std::fs::create_dir_all(&src).map_err(s)?;
+    for e in std::fs::read_dir(dir).map_err(s)?.flatten().filter(|e| e.file_name() != "_client") {
+        std::fs::rename(e.path(), src.join(e.file_name())).map_err(s)?;
+    }
+    let game = [".minecraft", "minecraft"].map(|n| src.join(n)).into_iter().find(|p| p.is_dir()).unwrap_or(src.clone());
+    let mods = game.join("mods");
+    let detected = match from_instance(&game)? {
+        Some(d) => d,
+        None => {
+            return Err("Couldn't tell which loader and Minecraft version this pack uses. Ask for the pack's server files instead.".into());
+        }
+    };
+    copy_instance(&game, &mods, dir, log)?;
+    std::fs::remove_dir_all(&src).map_err(s)?;
+    Ok(detected)
 }
 
 #[cfg(test)]
@@ -824,6 +851,35 @@ mod tests {
         assert!(out.join("mods/lithium.jar").exists());
         assert!(!out.join("mods/minimap.jar").exists());
         assert!(out.join("config/lithium.properties").exists());
+        std::fs::remove_dir_all(&d).unwrap();
+
+        // the same instance exported as a client pack: refused unless cleaning was agreed to
+        let pack = d.join("pack");
+        std::fs::create_dir_all(pack.join(".minecraft/mods")).unwrap();
+        std::fs::create_dir_all(pack.join(".minecraft/config")).unwrap();
+        std::fs::write(pack.join("instance.cfg"), "").unwrap();
+        std::fs::write(
+            pack.join("mmc-pack.json"),
+            r#"{"components":[{"uid":"net.minecraft","version":"1.21.1"},{"uid":"net.fabricmc.fabric-loader","version":"0.16.5"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(pack.join(".minecraft/config/lithium.properties"), "x").unwrap();
+        jar(&pack.join(".minecraft/mods/lithium.jar"), "fabric.mod.json", r#"{"id":"lithium"}"#);
+        jar(&pack.join(".minecraft/mods/minimap.jar"), "fabric.mod.json", r#"{"id":"minimap","environment":"client"}"#);
+        let src = pack.to_string_lossy().into_owned();
+        for (clean, out) in [(false, d.join("a")), (true, d.join("b"))] {
+            std::fs::create_dir_all(&out).unwrap();
+            let got = crate::packs::import(&src, &out, None, clean, &Log::default());
+            if !clean {
+                assert_eq!(got.unwrap_err(), crate::packs::CLIENT_PACK);
+                continue;
+            }
+            assert_eq!(got.unwrap(), (Flavor::Fabric, "1.21.1".into(), Some("0.16.5".into())));
+            assert!(out.join("mods/lithium.jar").exists());
+            assert!(out.join(CLIENT_ONLY).join("minimap.jar").exists());
+            assert!(out.join("config/lithium.properties").exists());
+            assert!(!out.join("_client").exists() && !out.join("mmc-pack.json").exists());
+        }
         std::fs::remove_dir_all(&d).unwrap();
 
         // real jars: Sodium is client-only on Modrinth, Lithium runs on servers

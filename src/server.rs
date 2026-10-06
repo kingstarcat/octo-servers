@@ -341,26 +341,6 @@ pub fn backup(dir: &Path, auto: bool, log: &Log) -> Result<PathBuf, String> {
     let mut z = zip::ZipWriter::new(std::fs::File::create(&tmp).map_err(s)?);
     let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated).large_file(true);
     let mut n = 0;
-    fn add(
-        z: &mut zip::ZipWriter<std::fs::File>,
-        base: &Path,
-        p: &Path,
-        opts: zip::write::SimpleFileOptions,
-        n: &mut usize,
-    ) -> Result<(), String> {
-        for e in std::fs::read_dir(p).map_err(s)?.flatten() {
-            let path = e.path();
-            let rel = path.strip_prefix(base).map_err(s)?.to_string_lossy().replace('\\', "/");
-            if path.is_dir() {
-                add(z, base, &path, opts, n)?;
-            } else if path.file_name().is_some_and(|f| f != "session.lock") {
-                z.start_file(rel, opts).map_err(s)?;
-                std::io::copy(&mut std::fs::File::open(&path).map_err(s)?, z).map_err(s)?;
-                *n += 1;
-            }
-        }
-        Ok(())
-    }
     for w in &worlds {
         push(log, format!("Backing up {}", w.file_name().unwrap_or_default().to_string_lossy()));
         add(&mut z, dir, w, opts, &mut n)?;
@@ -382,6 +362,64 @@ pub fn backup(dir: &Path, auto: bool, log: &Log) -> Result<PathBuf, String> {
         }
     }
     Ok(out)
+}
+
+/// Zip everything under `p` into `z`, with paths relative to `base`. Skips session.lock (locked
+/// while the server runs) and the server's own backups folder.
+fn add(
+    z: &mut zip::ZipWriter<std::fs::File>,
+    base: &Path,
+    p: &Path,
+    opts: zip::write::SimpleFileOptions,
+    n: &mut usize,
+) -> Result<(), String> {
+    for e in std::fs::read_dir(p).map_err(s)?.flatten() {
+        let path = e.path();
+        let rel = path.strip_prefix(base).map_err(s)?.to_string_lossy().replace('\\', "/");
+        if path.is_dir() {
+            if path != base.join("backups") {
+                add(z, base, &path, opts, n)?;
+            }
+        } else if path.file_name().is_some_and(|f| f != "session.lock") {
+            z.start_file(rel, opts).map_err(s)?;
+            std::io::copy(&mut std::fs::File::open(&path).map_err(s)?, z).map_err(s)?;
+            *n += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Zip the whole server folder (minus its backups) to `out`.
+pub fn export(dir: &Path, out: &Path, log: &Log) -> Result<(), String> {
+    let tmp = out.with_extension("part");
+    let mut z = zip::ZipWriter::new(std::fs::File::create(&tmp).map_err(|e| format!("Couldn't write {}: {e}", out.display()))?);
+    let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated).large_file(true);
+    let mut n = 0;
+    let r = add(&mut z, dir, dir, opts, &mut n).and_then(|_| z.finish().map(|_| ()).map_err(s));
+    if let Err(e) = r {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    std::fs::rename(&tmp, out).map_err(s)?;
+    push(log, format!("Exported {n} files to {}", out.display()));
+    Ok(())
+}
+
+/// Back up the world, then delete it; the server makes a new one on its next start.
+pub fn delete_world(dir: &Path, log: &Log) -> Result<(), String> {
+    backup(dir, false, log)?;
+    for w in world_dirs(dir) {
+        std::fs::remove_dir_all(&w).map_err(|e| format!("Couldn't delete {}: {e}", w.display()))?;
+    }
+    push(log, "World deleted. A new one is made the next time the server starts.");
+    Ok(())
+}
+
+/// Rename a server (its folder).
+pub fn rename(dir: &Path, new: &str) -> Result<(), String> {
+    validate_name(new)?;
+    std::fs::rename(dir, servers_dir().join(new.trim()))
+        .map_err(|e| format!("Couldn't rename the folder: {e}. Close anything using it and try again."))
 }
 
 /// Total physical memory in MB, if the OS tells us.
@@ -493,6 +531,29 @@ mod tests {
         assert_eq!(files.iter().filter(|f| f.starts_with("auto-")).count(), KEEP_AUTO_BACKUPS);
         assert_eq!(files.iter().filter(|f| !f.starts_with("auto-")).count(), 1, "manual backups are never pruned");
         assert!(backup(&d.join("nope"), false, &log).is_err());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn exports_server_and_deletes_world() {
+        let d = std::env::temp_dir().join(format!("octo-export-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let srv = d.join("srv");
+        std::fs::create_dir_all(srv.join("world/region")).unwrap();
+        std::fs::create_dir_all(srv.join("backups")).unwrap();
+        std::fs::write(srv.join("world/level.dat"), "x").unwrap();
+        std::fs::write(srv.join("world/session.lock"), "x").unwrap();
+        std::fs::write(srv.join("octo.json"), "{}").unwrap();
+        std::fs::write(srv.join("backups/old.zip"), "x").unwrap();
+        let log = Log::default();
+        export(&srv, &d.join("out.zip"), &log).unwrap();
+        let z = zip::ZipArchive::new(std::fs::File::open(d.join("out.zip")).unwrap()).unwrap();
+        let mut names: Vec<&str> = z.file_names().collect();
+        names.sort();
+        assert_eq!(names, ["octo.json", "world/level.dat"]);
+        delete_world(&srv, &log).unwrap();
+        assert!(!has_world(&srv) && srv.join("octo.json").exists());
+        assert_eq!(std::fs::read_dir(srv.join("backups")).unwrap().count(), 2);
         std::fs::remove_dir_all(&d).unwrap();
     }
 
