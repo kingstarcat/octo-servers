@@ -1,6 +1,6 @@
 [package]
 name = "octo-servers"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2024"
 description = "Desktop app for hosting Minecraft servers, with modpack import, Java setup and playit.gg tunnels."
 
@@ -25,6 +25,7 @@ path = "src/main.rs"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
+tray-icon = "0.24.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18.2"

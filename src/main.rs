@@ -450,6 +450,10 @@ struct App {
     updated_exe: Arc<Mutex<Option<PathBuf>>>,
     /// Mods tab: result of "Check for updates" (strong count > 1 while checking)
     mod_updates: ModUpdates,
+    /// closing the window hides it to the tray; this is set when the app should really exit
+    quitting: bool,
+    #[cfg(windows)]
+    tray: Option<tray_icon::TrayIcon>,
 }
 
 impl App {
@@ -488,6 +492,9 @@ impl App {
             update_dismissed: false,
             updated_exe: Default::default(),
             mod_updates: Default::default(),
+            quitting: false,
+            #[cfg(windows)]
+            tray: tray(),
         };
         PARALLEL.store(app.settings.parallel_downloads, Ordering::Relaxed);
         app.reload();
@@ -592,8 +599,8 @@ fn console(ui: &mut egui::Ui, id: &str, log: &Log) {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
+    // Also runs while the window is hidden in the tray, so servers keep restarting and tasks finish.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(250));
         self.poll_task();
         for i in 0..self.servers.len() {
@@ -602,6 +609,39 @@ impl eframe::App for App {
                 self.start_now(i);
             }
         }
+        #[cfg(windows)]
+        if self.tray.is_some() {
+            use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent, menu::MenuEvent};
+            let show = |ctx: &egui::Context| {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            };
+            while let Ok(e) = TrayIconEvent::receiver().try_recv() {
+                if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. }
+                | TrayIconEvent::DoubleClick { .. } = e
+                {
+                    show(ctx);
+                }
+            }
+            while let Ok(e) = MenuEvent::receiver().try_recv() {
+                match e.id.as_ref() {
+                    "open" => show(ctx),
+                    "quit" => {
+                        self.quitting = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    _ => {}
+                }
+            }
+            if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
 
         if let Some(search) = &mut self.cf_search {
             ctx.request_repaint_after(Duration::from_millis(50));
@@ -1298,6 +1338,7 @@ impl App {
                 ui.label("Restart Octo Servers to use the new version. Running servers are stopped first.");
                 if ui.button("Restart now").clicked() {
                     let _ = cmd(&exe).spawn();
+                    self.quitting = true;
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             });
@@ -1491,6 +1532,24 @@ impl Drop for App {
         }
         self.playit.stop();
     }
+}
+
+/// Tray icon with Open and Quit. None if Windows refuses it; closing the window then exits as before.
+#[cfg(windows)]
+fn tray() -> Option<tray_icon::TrayIcon> {
+    use tray_icon::menu::{Menu, MenuItem};
+    let png = image::load_from_memory(include_bytes!("../assets/tray.png")).ok()?.into_rgba8();
+    let (w, h) = png.dimensions();
+    let menu = Menu::new();
+    menu.append(&MenuItem::with_id("open", "Open Octo Servers", true, None)).ok()?;
+    menu.append(&MenuItem::with_id("quit", "Quit", true, None)).ok()?;
+    tray_icon::TrayIconBuilder::new()
+        .with_tooltip("Octo Servers")
+        .with_icon(tray_icon::Icon::from_rgba(png.into_raw(), w, h).ok()?)
+        .with_menu(Box::new(menu))
+        .with_menu_on_left_click(false)
+        .build()
+        .ok()
 }
 
 /// Save what went wrong to `<data dir>/crash.txt` (release builds have no console on Windows,
