@@ -301,10 +301,13 @@ fn atl_pack(safe: &str, dir: &Path, log: &Log) -> Result<Detected, String> {
         }
         None => (Flavor::Vanilla, None),
     };
-    let (jobs, mut failed) = atl_jobs(&c, &mc, dir, log)?;
+    let (jobs, mut failed, skipped) = atl_jobs(&c, &mc, dir, log)?;
     push(log, format!("Downloading {} server-side files...", jobs.len()));
     failed.extend(download_all(jobs, log));
     finish_downloads(failed)?;
+    if skipped && matches!(flavor, Flavor::Forge | Flavor::NeoForge) {
+        sources::upgrade_requirements(&dir.join("mods"), &mc, flavor, log);
+    }
     if c["noConfigs"] != true {
         push(log, "Downloading configs...");
         let zip = dir.join("_configs.zip");
@@ -318,9 +321,9 @@ fn atl_pack(safe: &str, dir: &Path, log: &Log) -> Result<Detected, String> {
 
 /// Where each server-side mod in an ATLauncher config comes from and goes to. Optional mods are
 /// included when the pack recommends them, like ATLauncher's own install. Also returns the mods
-/// whose CurseForge download couldn't be resolved.
-fn atl_jobs(c: &Value, mc: &str, dir: &Path, log: &Log) -> Result<(Vec<crate::Job>, Vec<String>), String> {
-    let (mut jobs, mut unresolved) = (vec![], vec![]);
+/// whose CurseForge download couldn't be resolved, and whether any were skipped as gone.
+fn atl_jobs(c: &Value, mc: &str, dir: &Path, log: &Log) -> Result<(Vec<crate::Job>, Vec<String>, bool), String> {
+    let (mut jobs, mut unresolved, mut skipped) = (vec![], vec![], false);
     for m in c["mods"].as_array().into_iter().flatten() {
         let name = m["name"].as_str().unwrap_or("?");
         if m["server"] == false || (m["optional"] == true && m["recommended"] != true) {
@@ -338,11 +341,18 @@ fn atl_jobs(c: &Value, mc: &str, dir: &Path, log: &Log) -> Result<(Vec<crate::Jo
         };
         let file = m["file"].as_str().unwrap_or(name);
         let ids = (m["curse_id"].as_u64(), m["curse_file_id"].as_u64());
-        let url = match (m["download"].as_str(), m["url"].as_str(), ids) {
-            (Some("server"), Some(u), _) => format!("{}/{}", sources::ATL_CDN, u.split('/').map(crate::enc).collect::<Vec<_>>().join("/")),
-            (Some("direct"), Some(u), _) => sources::mediafilez(u),
-            (_, _, (Some(p), Some(f))) => match sources::cf_download_url(p, f) {
+        let (url, sha1) = match (m["download"].as_str(), m["url"].as_str(), ids) {
+            (Some("server"), Some(u), _) => {
+                (format!("{}/{}", sources::ATL_CDN, u.split('/').map(crate::enc).collect::<Vec<_>>().join("/")), None)
+            }
+            (Some("direct"), Some(u), _) => (sources::mediafilez(u), None),
+            (_, _, (Some(p), Some(f))) => match sources::cf_file(p, f) {
                 Ok(u) => u,
+                Err(e) if e.starts_with(sources::CF_GONE) => {
+                    push(log, format!("WARN skipped {name}. {e}. The pack may not work as intended."));
+                    skipped = true;
+                    continue;
+                }
                 Err(e) => {
                     push(log, format!("WARN {name}: {e}"));
                     unresolved.push(name.to_string());
@@ -355,9 +365,9 @@ fn atl_jobs(c: &Value, mc: &str, dir: &Path, log: &Log) -> Result<(Vec<crate::Jo
             }
         };
         let to = safe_join(dir, &format!("{sub}/{file}")).ok_or(format!("modpack has an unsafe path: {file}"))?;
-        jobs.push((url, to, None));
+        jobs.push((url, to, sha1));
     }
-    Ok((jobs, unresolved))
+    Ok((jobs, unresolved, skipped))
 }
 
 fn cf_manifest(dir: &Path) -> Option<Value> {
@@ -376,13 +386,17 @@ fn cf_client_pack(dir: &Path, m: &Value, log: &Log) -> Result<Detected, String> 
     let mods = dir.join("mods");
     let files = m["files"].as_array().cloned().unwrap_or_default();
     push(log, format!("Resolving {} mods on CurseForge...", files.len()));
-    let (mut jobs, mut unresolved, mut ids) = (vec![], vec![], crate::worlds::CfIds::new());
+    let (mut jobs, mut unresolved, mut ids, mut skipped) = (vec![], vec![], crate::worlds::CfIds::new(), false);
     for f in &files {
         let (p, id) = (f["projectID"].as_u64().unwrap_or(0), f["fileID"].as_u64().unwrap_or(0));
-        match sources::cf_download_url(p, id) {
-            Ok(url) => {
+        match sources::cf_file(p, id) {
+            Ok((url, sha1)) => {
                 ids.insert(crate::url_file_name(&url), (p, id));
-                jobs.push((url.clone(), mods.join(crate::url_file_name(&url)), None));
+                jobs.push((url.clone(), mods.join(crate::url_file_name(&url)), sha1));
+            }
+            Err(e) if e.starts_with(sources::CF_GONE) => {
+                push(log, format!("WARN skipped a mod. {e}. The pack may not work as intended."));
+                skipped = true;
             }
             Err(e) => {
                 push(log, format!("WARN {e}"));
@@ -395,6 +409,10 @@ fn cf_client_pack(dir: &Path, m: &Value, log: &Log) -> Result<Detected, String> 
     let overrides = m["overrides"].as_str().unwrap_or("overrides");
     if let Some(o) = safe_join(dir, overrides).filter(|o| o.is_dir()) {
         move_into(&o, dir)?;
+    }
+    // overrides can hold mods too
+    if skipped && matches!(flavor, Flavor::Forge | Flavor::NeoForge) {
+        sources::upgrade_requirements(&mods, &mc, flavor, log);
     }
     let _ = std::fs::remove_file(dir.join("manifest.json"));
     let _ = std::fs::remove_file(dir.join("modlist.html"));
@@ -552,7 +570,7 @@ mod tests {
         )
         .unwrap();
         let (d, log) = (Path::new("/srv/s"), Log::default());
-        let (jobs, unresolved) = atl_jobs(&c, "1.12.2", d, &log).unwrap();
+        let (jobs, unresolved, _) = atl_jobs(&c, "1.12.2", d, &log).unwrap();
         assert_eq!(
             jobs,
             [
@@ -574,7 +592,7 @@ mod tests {
         let hits = sources::atl_search("all the forge").unwrap();
         let safe = hits.iter().find_map(|h| sources::parse_atl(&h.slug)).unwrap();
         let (_, c) = sources::atl_config(&safe).unwrap();
-        let (jobs, _) = atl_jobs(&c, c["minecraft"].as_str().unwrap(), Path::new("/srv/s"), &Log::default()).unwrap();
+        let (jobs, ..) = atl_jobs(&c, c["minecraft"].as_str().unwrap(), Path::new("/srv/s"), &Log::default()).unwrap();
         assert!(jobs.len() > 50, "{safe}: {} jobs", jobs.len());
         let probe = std::env::temp_dir().join(format!("octo-atl-{}.jar", std::process::id()));
         crate::download(&jobs[0].0, &probe).unwrap();

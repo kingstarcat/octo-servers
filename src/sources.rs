@@ -420,6 +420,187 @@ pub fn apply_mod_update(u: &ModUpdate, log: &Log) -> Result<(), String> {
     Ok(())
 }
 
+// ---------- Required versions (Forge / NeoForge mods.toml) ----------
+
+/// Compare versions numerically per dot-separated part (each part's leading digits; missing = 0).
+fn cmp_version(a: &str, b: &str) -> std::cmp::Ordering {
+    let parts = |v: &str| -> Vec<u64> {
+        v.split('.').map(|p| p.chars().take_while(char::is_ascii_digit).collect::<String>().parse().unwrap_or(0)).collect()
+    };
+    let (a, b) = (parts(a), parts(b));
+    (0..a.len().max(b.len()))
+        .map(|i| a.get(i).unwrap_or(&0).cmp(b.get(i).unwrap_or(&0)))
+        .find(|o| o.is_ne())
+        .unwrap_or(std::cmp::Ordering::Equal)
+}
+
+/// Maven version range: `[a,b)`, `(a,]`, `[a]` and comma-separated unions of those. A bare
+/// version or `*` is only a preference, so it accepts anything.
+pub fn in_range(v: &str, range: &str) -> bool {
+    use std::cmp::Ordering::*;
+    let mut rest = range.trim();
+    if !rest.starts_with(['[', '(']) {
+        return true;
+    }
+    while let Some(start) = rest.find(['[', '(']) {
+        let Some(len) = rest[start..].find([']', ')']) else { return true };
+        let iv = &rest[start..=start + len];
+        rest = &rest[start + len + 1..];
+        let inner = &iv[1..iv.len() - 1];
+        let ok = match inner.split_once(',') {
+            None => cmp_version(v, inner.trim()) == Equal,
+            Some((lo, hi)) => {
+                let (lo, hi) = (lo.trim(), hi.trim());
+                (lo.is_empty() || matches!((cmp_version(v, lo), iv.starts_with('[')), (Greater, _) | (Equal, true)))
+                    && (hi.is_empty() || matches!((cmp_version(v, hi), iv.ends_with(']')), (Less, _) | (Equal, true)))
+            }
+        };
+        if ok {
+            return true;
+        }
+    }
+    false
+}
+
+/// What a Forge / NeoForge mods.toml declares: (modId, version) and required (modId, versionRange).
+#[derive(Default, Debug, PartialEq)]
+struct ModsToml {
+    mods: Vec<(String, String)>,
+    deps: Vec<(String, String)>,
+}
+
+/// Line-based read of the few mods.toml keys needed. `jar_version` replaces `${file.jarVersion}`.
+fn parse_mods_toml(t: &str, jar_version: Option<&str>) -> ModsToml {
+    let mut tables: Vec<(&str, std::collections::HashMap<&str, String>)> = vec![];
+    let mut multi: Option<&str> = None;
+    for l in t.lines().map(str::trim) {
+        if let Some(q) = multi {
+            if l.contains(q) {
+                multi = None;
+            }
+            continue;
+        }
+        if l.starts_with('[') {
+            let kind = if l.starts_with("[[mods]]") {
+                "mods"
+            } else if l.starts_with("[[dependencies.") {
+                "dep"
+            } else {
+                ""
+            };
+            tables.push((kind, Default::default()));
+            continue;
+        }
+        let Some((k, v)) = l.split_once('=') else { continue };
+        let v = v.trim();
+        if let Some(q) = ["'''", "\"\"\""].into_iter().find(|q| v.starts_with(q)) {
+            multi = (!v[3..].contains(q)).then_some(q);
+            continue;
+        }
+        let v = match v.chars().next().filter(|c| ['"', '\''].contains(c)) {
+            Some(q) => v[1..].split(q).next().unwrap_or(""),
+            None => v.split('#').next().unwrap_or("").trim(),
+        };
+        if let Some((_, t)) = tables.last_mut() {
+            t.insert(k.trim(), v.to_string());
+        }
+    }
+    let mut out = ModsToml::default();
+    for (kind, t) in &tables {
+        let Some(id) = t.get("modId").filter(|i| !i.is_empty()) else { continue };
+        let get = |k: &str| t.get(k).map_or("", |v| v.as_str());
+        if *kind == "mods" {
+            let v = get("version");
+            let v = if v == "${file.jarVersion}" { jar_version.unwrap_or("") } else { v };
+            out.mods.push((id.clone(), v.to_string()));
+        } else if *kind == "dep" && (get("type").eq_ignore_ascii_case("required") || get("mandatory") == "true") {
+            out.deps.push((id.clone(), get("versionRange").to_string()));
+        }
+    }
+    out
+}
+
+fn jar_mods_toml(jar: &Path) -> Option<ModsToml> {
+    use std::io::Read;
+    let mut z = zip::ZipArchive::new(std::fs::File::open(jar).ok()?).ok()?;
+    let mut text = |name: &str| {
+        let mut t = String::new();
+        z.by_name(name).ok().and_then(|mut f| f.read_to_string(&mut t).ok()).map(|_| t)
+    };
+    let toml = text("META-INF/neoforge.mods.toml").or_else(|| text("META-INF/mods.toml"))?;
+    let manifest = text("META-INF/MANIFEST.MF").unwrap_or_default();
+    let jar_version = manifest.lines().find_map(|l| l.strip_prefix("Implementation-Version:")).map(str::trim);
+    Some(parse_mods_toml(&toml, jar_version))
+}
+
+/// Last resort after a pack import skipped files: a mod older than a version another mod requires
+/// is replaced by the newest Modrinth version of the same file, if that one meets every range.
+/// Problems only log warnings; the import goes on.
+pub fn upgrade_requirements(mods: &Path, mc: &str, f: Flavor, log: &Log) {
+    let jars: Vec<(PathBuf, ModsToml)> = mod_files(mods)
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|x| x == "jar"))
+        .filter_map(|p| Some((jar_mods_toml(&p)?, p)))
+        .map(|(m, p)| (p, m))
+        .collect();
+    let installed: std::collections::HashMap<&str, (usize, &str)> =
+        jars.iter().enumerate().flat_map(|(i, (_, m))| m.mods.iter().map(move |(id, v)| (id.as_str(), (i, v.as_str())))).collect();
+    // jar index -> (range, why)
+    let mut need: std::collections::BTreeMap<usize, Vec<(String, String)>> = Default::default();
+    for (p, m) in &jars {
+        for (dep, range) in &m.deps {
+            if let Some(&(i, v)) = installed.get(dep.as_str())
+                && !v.is_empty()
+                && !in_range(v, range)
+            {
+                let why = format!("{} needs {dep} {range}", p.file_name().unwrap_or_default().to_string_lossy());
+                need.entry(i).or_default().push((range.clone(), why));
+            }
+        }
+    }
+    if need.is_empty() {
+        return;
+    }
+    let hashes: Vec<(usize, String)> = need.keys().filter_map(|&i| Some((i, sha1_file(&jars[i].0)?))).collect();
+    let body = serde_json::json!({
+        "hashes": hashes.iter().map(|(_, h)| h).collect::<Vec<_>>(),
+        "algorithm": "sha1",
+        "loaders": loaders(f),
+        "game_versions": [mc],
+    });
+    let r = match post_json(&format!("{MR}/version_files/update"), body) {
+        Ok(r) => r,
+        Err(e) => {
+            return push(
+                log,
+                format!("WARN couldn't look for newer versions of outdated mods on Modrinth ({e}). The server may not start."),
+            );
+        }
+    };
+    for (i, h) in hashes {
+        let (old, why) = (&jars[i].0, need[&i].iter().map(|(_, w)| w.as_str()).collect::<Vec<_>>().join(", "));
+        let old_name = old.file_name().unwrap_or_default().to_string_lossy();
+        let v = &r[&h];
+        let pf = primary_file(v).filter(|pf| pf["hashes"]["sha1"] != h.as_str());
+        let (Some(_), Some(pf)) = (v["version_number"].as_str().filter(|n| need[&i].iter().all(|(r, _)| in_range(n, r))), pf) else {
+            push(log, format!("WARN {old_name} is too old ({why}) and Modrinth has no version that fits. The server may not start."));
+            continue;
+        };
+        let (Some(url), Some(sha1), Some(name)) = (pf["url"].as_str(), pf["hashes"]["sha1"].as_str(), pf["filename"].as_str()) else {
+            continue;
+        };
+        let to = mods.join(url_file_name(name));
+        if let Err(e) = download(url, &to).and_then(|_| crate::verify(&to, sha1)) {
+            push(log, format!("WARN couldn't download {name} to replace {old_name} ({e}). The server may not start."));
+            continue;
+        }
+        if &to != old {
+            let _ = std::fs::remove_file(old);
+        }
+        push(log, format!("Replaced {old_name} with {name} because {why}"));
+    }
+}
+
 // ---------- CurseForge (no API key) ----------
 
 pub struct CfLink {
@@ -501,12 +682,105 @@ pub fn mediafilez(url: &str) -> String {
     url.replace("://edge.forgecdn.net/", "://mediafilez.forgecdn.net/")
 }
 
-pub fn cf_download_url(pid: u64, fid: u64) -> Result<String, String> {
+/// Start of the error for a CurseForge file that can't be downloaded anywhere. Pack imports skip
+/// these with a warning; any other error means a check failed and the import can be retried.
+pub const CF_GONE: &str = "No longer on CurseForge";
+/// Public mirror of the official CurseForge API (keyless). Its rules: fallback use only, with the
+/// app's own User-Agent.
+const MCIM: &str = "https://mod.mcimirror.top/curseforge/v1/mods";
+
+/// What one source says about a CurseForge file.
+#[derive(Debug, PartialEq)]
+enum Cf {
+    /// Download link and sha1 when known.
+    Url(String, Option<String>),
+    Gone,
+    Unknown,
+}
+
+/// GET without following redirects or turning 4xx/5xx into errors: status, Location header, and
+/// the body as JSON (Null if it isn't). None when there was no answer.
+fn probe(url: &str) -> Option<(u16, Option<String>, Value)> {
     let agent: ureq::Agent =
         ureq::Agent::config_builder().max_redirects(0).max_redirects_will_error(false).http_status_as_error(false).build().into();
-    let r = agent.get(format!("{CF}/{pid}/files/{fid}/download")).header("User-Agent", UA).call().map_err(s)?;
-    let loc = r.headers().get("location").and_then(|v| v.to_str().ok()).ok_or(format!("CurseForge file {fid} not downloadable"))?;
-    Ok(mediafilez(loc.split('?').next().unwrap_or(loc)))
+    let mut r = agent.get(url).header("User-Agent", UA).call().ok()?;
+    let loc = r.headers().get("location").and_then(|v| v.to_str().ok()).map(String::from);
+    let body = r.body_mut().with_config().limit(50 << 20).read_to_string().ok()?;
+    Some((r.status().as_u16(), loc, serde_json::from_str(&body).unwrap_or(Value::Null)))
+}
+
+/// 200 with JSON: whatever `found` makes of it, else gone. 404: gone. Anything else: unknown.
+fn answer(p: Option<(u16, Option<String>, Value)>, found: impl FnOnce(&Value) -> Option<Cf>) -> Cf {
+    match p {
+        Some((200, _, v)) if !v.is_null() => found(&v).unwrap_or(Cf::Gone),
+        Some((404, ..)) => Cf::Gone,
+        _ => Cf::Unknown,
+    }
+}
+
+/// MCIM's copy of the official file info. An unavailable file (author blocks other launchers)
+/// has no usable link, so it's looked up on Modrinth by sha1, like Prism does.
+fn mcim_answer(p: Option<(u16, Option<String>, Value)>, cdn: impl Fn(&str) -> String, modrinth: impl FnOnce(&str) -> Cf) -> Cf {
+    answer(p, |v| {
+        let d = &v["data"];
+        let name = d["fileName"].as_str()?;
+        let sha1 = d["hashes"].as_array()?.iter().find(|h| h["algo"] == 1).and_then(|h| h["value"].as_str());
+        if d["isAvailable"] == true && d["downloadUrl"].is_string() {
+            return Some(Cf::Url(cdn(name), sha1.map(String::from)));
+        }
+        Some(sha1.map_or(Cf::Gone, modrinth))
+    })
+}
+
+fn modrinth_by_sha1(h: &str) -> Cf {
+    answer(probe(&format!("{MR}/version_file/{h}?algorithm=sha1")), |v| {
+        let f = v["files"].as_array()?.iter().find(|f| f["hashes"]["sha1"] == h)?;
+        Some(Cf::Url(f["url"].as_str()?.to_string(), Some(h.to_string())))
+    })
+}
+
+/// First link wins. Gone only when every source says so; one unanswered check makes it unknown.
+fn settle(checks: impl Iterator<Item = Cf>, pid: u64, fid: u64) -> Result<(String, Option<String>), String> {
+    let mut unsure = false;
+    for c in checks {
+        match c {
+            Cf::Url(u, h) => return Ok((u, h)),
+            Cf::Unknown => unsure = true,
+            Cf::Gone => {}
+        }
+    }
+    Err(if unsure {
+        format!("Couldn't check CurseForge file {fid}. Check your internet connection and retry.")
+    } else {
+        format!("{CF_GONE}: file {fid} of project {pid} can't be downloaded from CurseForge and isn't on Modrinth")
+    })
+}
+
+/// Download link and sha1 (when known) of a CurseForge file. Checks, in order: the download
+/// redirect, the website's file info, MCIM (then Modrinth for files hidden from other
+/// launchers), and cfwidget's file list.
+pub fn cf_file(pid: u64, fid: u64) -> Result<(String, Option<String>), String> {
+    // forgecdn paths are /files/<id / 1000>/<id % 1000>/<file name>
+    let cdn = |name: &str| format!("https://mediafilez.forgecdn.net/files/{}/{}/{}", fid / 1000, fid % 1000, enc(name));
+    let download = || match probe(&format!("{CF}/{pid}/files/{fid}/download")) {
+        Some((_, Some(loc), _)) => Cf::Url(mediafilez(loc.split('?').next().unwrap_or(&loc)), None),
+        Some((404, ..)) => Cf::Gone,
+        _ => Cf::Unknown,
+    };
+    let site = || answer(probe(&format!("{CF}/{pid}/files/{fid}")), |v| Some(Cf::Url(cdn(v["data"]["fileName"].as_str()?), None)));
+    let mcim = || mcim_answer(probe(&format!("{MCIM}/{pid}/files/{fid}")), cdn, modrinth_by_sha1);
+    let widget = || {
+        answer(probe(&format!("https://api.cfwidget.com/{pid}")), |v| {
+            let f = v["files"].as_array()?.iter().find(|f| f["id"].as_u64() == Some(fid))?;
+            Some(Cf::Url(cdn(f["name"].as_str()?), None))
+        })
+    };
+    let checks: [&dyn Fn() -> Cf; 4] = [&download, &site, &mcim, &widget];
+    settle(checks.iter().map(|c| c()), pid, fid)
+}
+
+pub fn cf_download_url(pid: u64, fid: u64) -> Result<String, String> {
+    cf_file(pid, fid).map(|(u, _)| u)
 }
 
 fn cf_matches(file: &Value, mc: &str, f: Flavor) -> bool {
@@ -788,5 +1062,84 @@ mod tests {
         assert_eq!(parse_technic("https://www.technicpack.net/modpack/hexxit"), Some("hexxit".into()));
         assert_eq!(parse_atl("https://atlauncher.com/pack/AllTheForge10?x=1"), Some("AllTheForge10".into()));
         assert!(parse_technic("https://modrinth.com/mod/x").is_none() && parse_atl("https://modrinth.com/mod/x").is_none());
+    }
+
+    #[test]
+    fn version_ranges() {
+        assert!(!in_range("1.113.1", "[1.119.0,)"));
+        assert!(in_range("1.120.2", "[1.119.0,)"));
+        assert!(in_range("1.119.0", "[1.119.0,)") && !in_range("1.119.0", "(1.119.0,)"));
+        assert!(in_range("2.0", "(1.0,2.0]") && !in_range("2.0", "(1.0,2.0)") && !in_range("1.0", "(1.0,2.0]"));
+        assert!(in_range("1.5", "[1.5]") && !in_range("1.5.1", "[1.5]"));
+        assert!(in_range("1.0.0", "[1.0]"), "missing parts count as 0");
+        assert!(in_range("3.1", "[1,2),[3,)") && !in_range("2.5", "[1,2),[3,)"));
+        assert!(in_range("0.1", "1.5") && in_range("0.1", "*") && in_range("0.1", ""));
+        assert!(in_range("1.10", "[1.9,)"), "numeric, not text, comparison");
+        assert!(in_range("21.1.65-beta", "[21.1.0,)"));
+    }
+
+    #[test]
+    fn reads_mods_toml() {
+        let t = r#"
+modLoader="javafml"
+[[mods]] #main
+modId="advancedperipherals"
+version="${file.jarVersion}"
+description='''
+modId="fake"
+'''
+[[dependencies.advancedperipherals]]
+    modId="computercraft"
+    type="required" # needed
+    versionRange="[1.119.0,)"
+[[dependencies.advancedperipherals]]
+    modId='jei'
+    type="optional"
+    versionRange="[1,)"
+[[dependencies.advancedperipherals]]
+    modId="minecraft"
+    mandatory=true
+    versionRange="[1.21.1]"
+"#;
+        let m = parse_mods_toml(t, Some("0.7.41"));
+        assert_eq!(m.mods, vec![("advancedperipherals".into(), "0.7.41".into())]);
+        assert_eq!(m.deps, vec![("computercraft".into(), "[1.119.0,)".into()), ("minecraft".into(), "[1.21.1]".into())]);
+    }
+
+    #[test]
+    fn hidden_files_vs_unknown() {
+        let cdn = |n: &str| format!("cdn/{n}");
+        let ok = |v: Value| Some((200, None, v));
+        let file = |avail: bool| {
+            serde_json::json!({"data": {"fileName": "a.jar", "isAvailable": avail, "downloadUrl": "x",
+                "hashes": [{"value": "md5", "algo": 2}, {"value": "abc", "algo": 1}]}})
+        };
+        let mr = |h: &str| Cf::Url(format!("mr/{h}"), Some(h.into()));
+        assert_eq!(mcim_answer(ok(file(true)), cdn, mr), Cf::Url("cdn/a.jar".into(), Some("abc".into())));
+        assert_eq!(mcim_answer(ok(file(false)), cdn, mr), Cf::Url("mr/abc".into(), Some("abc".into())));
+        assert_eq!(mcim_answer(ok(file(false)), cdn, |_| Cf::Gone), Cf::Gone);
+        assert_eq!(mcim_answer(ok(serde_json::json!({"data": null})), cdn, mr), Cf::Gone);
+        assert_eq!(mcim_answer(Some((404, None, Value::Null)), cdn, mr), Cf::Gone);
+        assert_eq!(mcim_answer(Some((502, None, Value::Null)), cdn, mr), Cf::Unknown);
+        assert_eq!(mcim_answer(None, cdn, mr), Cf::Unknown);
+        assert_eq!(mcim_answer(Some((200, None, Value::Null)), cdn, mr), Cf::Unknown, "not JSON, like a block page");
+
+        assert!(settle([Cf::Gone, Cf::Gone].into_iter(), 1, 2).unwrap_err().starts_with(CF_GONE));
+        let e = settle([Cf::Gone, Cf::Unknown, Cf::Gone].into_iter(), 1, 2).unwrap_err();
+        assert!(!e.starts_with(CF_GONE) && e.contains("retry"), "{e}");
+        assert_eq!(settle([Cf::Unknown, Cf::Url("u".into(), None)].into_iter(), 1, 2), Ok(("u".into(), None)));
+    }
+
+    /// ATM10's CC Tweaked Compat is hidden from other launchers; MCIM gives its sha1, which
+    /// Modrinth knows as the official CC: Tweaked.
+    /// cargo test hidden_cf_file_live -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn hidden_cf_file_live() {
+        let (url, sha1) = cf_file(1676502, 8778582).unwrap();
+        println!("{url}");
+        assert_eq!(url_file_name(&url), "cc-tweaked-1.21.1-forge-1.120.2.jar");
+        assert!(url.starts_with("https://cdn.modrinth.com/"), "{url}");
+        assert_eq!(sha1.as_deref(), Some("f35d4f636c2eb1b30c5d3f5c08e110c6acb8e02f"));
     }
 }

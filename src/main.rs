@@ -1740,7 +1740,7 @@ fn report_crash(what: &str, fatal: bool) {
         rfd::MessageDialog::new()
             .set_level(rfd::MessageLevel::Error)
             .set_title("Octo Servers crashed")
-            .set_description(format!("Octo Servers ran into a problem and has to close. {where_} Send that file to whoever gave you Octo."))
+            .set_description(format!("Octo Servers ran into a problem and has to close. {where_} Send that file to Mr. Kingstarcat."))
             .show();
     }
 }
