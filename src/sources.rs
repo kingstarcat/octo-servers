@@ -1,4 +1,4 @@
-//! Modrinth (public, keyless API) and CurseForge (crawled: cfwidget for slug -> id,
+//! Modrinth (public, keyless API) and CurseForge (cfwidget or the browser for slug -> id,
 //! curseforge.com's own file-list/download endpoints, forgecdn for the files).
 use crate::flavors::Flavor;
 use crate::{Log, UA, download, enc, get_json, push, s, url_file_name};
@@ -48,8 +48,22 @@ pub fn flavor_from(name: &str) -> Option<Flavor> {
 
 // ---------- Modrinth ----------
 
+/// Modrinth search results per page.
+pub const PAGE: usize = 40;
+/// Modrinth sort orders: (API index, label).
+pub const SORTS: [(&str, &str); 4] =
+    [("relevance", "Relevance"), ("downloads", "Downloads"), ("updated", "Recently updated"), ("newest", "Newest")];
+
 /// `kind` is "modpack" or "mod" (mods/plugins, filtered to ones that run server-side).
-pub fn modrinth_search(query: &str, kind: &str, mc: Option<&str>, f: Option<Flavor>) -> Result<Vec<Hit>, String> {
+/// `sort` is an index from `SORTS`; `offset` skips that many results (paging).
+pub fn modrinth_search(
+    query: &str,
+    kind: &str,
+    mc: Option<&str>,
+    f: Option<Flavor>,
+    offset: usize,
+    sort: &str,
+) -> Result<Vec<Hit>, String> {
     let mut facets: Vec<Vec<String>> = vec![vec![format!("project_type:{}", if f == Some(Flavor::Paper) { "plugin" } else { kind })]];
     if let Some(mc) = mc {
         facets.push(vec![format!("versions:{mc}")]);
@@ -61,7 +75,7 @@ pub fn modrinth_search(query: &str, kind: &str, mc: Option<&str>, f: Option<Flav
         facets.push(vec!["server_side:required".into(), "server_side:optional".into()]);
     }
     let facets = serde_json::to_string(&facets).map_err(s)?;
-    let r = get_json(&format!("{MR}/search?limit=40&query={}&facets={}", enc(query), enc(&facets)))?;
+    let r = get_json(&format!("{MR}/search?limit={PAGE}&offset={offset}&index={sort}&query={}&facets={}", enc(query), enc(&facets)))?;
     Ok(r["hits"]
         .as_array()
         .into_iter()
@@ -87,37 +101,169 @@ fn primary_file(v: &Value) -> Option<&Value> {
 }
 
 /// Install a Modrinth mod/plugin (plus its required dependencies) into `dest`.
-pub fn modrinth_install(id: &str, mc: &str, f: Flavor, dest: &Path, log: &Log, seen: &mut HashSet<String>) -> Result<(), String> {
-    let loaders = serde_json::to_string(loaders(f)).map_err(s)?;
-    let vs =
-        get_json(&format!("{MR}/project/{}/version?game_versions={}&loaders={}", enc(id), enc(&format!("[\"{mc}\"]")), enc(&loaders)))?;
-    let v = pick_version(&vs).ok_or(format!("{id} has no {f:?} version for Minecraft {mc}"))?;
-    install_version(v, mc, f, dest, log, seen)
+pub fn modrinth_install(id: &str, mc: &str, f: Flavor, dest: &Path, log: &Log) -> Result<(), String> {
+    let mut i = Install::new(mc, f, dest, log);
+    i.mr_project(id).map_err(|e| format!("{id}: {e}"))?;
+    i.finish(id)
 }
 
 /// Install one specific Modrinth version (picked on the project page) plus its required dependencies.
 pub fn modrinth_install_version(version_id: &str, mc: &str, f: Flavor, dest: &Path, log: &Log) -> Result<(), String> {
     let v = get_json(&format!("{MR}/version/{}", enc(version_id)))?;
-    install_version(&v, mc, f, dest, log, &mut HashSet::new())
+    let mut i = Install::new(mc, f, dest, log);
+    i.mr_version(&v)?;
+    i.finish(v["name"].as_str().unwrap_or(version_id))
 }
 
-fn install_version(v: &Value, mc: &str, f: Flavor, dest: &Path, log: &Log, seen: &mut HashSet<String>) -> Result<(), String> {
-    if !seen.insert(v["project_id"].as_str().unwrap_or("").to_string()) {
-        return Ok(());
+/// One mod install and the required mods it pulls in.
+struct Install<'a> {
+    mc: &'a str,
+    f: Flavor,
+    dest: &'a Path,
+    log: &'a Log,
+    seen: HashSet<String>,
+    /// required dependencies that couldn't be installed, with the reason
+    missing: Vec<String>,
+    /// Modrinth project of each mod already in `dest`, looked up once
+    installed: Option<Vec<(PathBuf, String)>>,
+}
+
+impl<'a> Install<'a> {
+    fn new(mc: &'a str, f: Flavor, dest: &'a Path, log: &'a Log) -> Self {
+        Install { mc, f, dest, log, seen: HashSet::new(), missing: vec![], installed: None }
     }
-    let file = primary_file(v).ok_or("version has no files")?;
-    let name = url_file_name(file["filename"].as_str().unwrap_or("mod.jar"));
-    push(log, format!("Installing {name}"));
-    std::fs::create_dir_all(dest).map_err(s)?;
-    download(file["url"].as_str().ok_or("no file url")?, &dest.join(&name))?;
-    for d in v["dependencies"].as_array().into_iter().flatten().filter(|d| d["dependency_type"] == "required") {
-        if let Some(pid) = d["project_id"].as_str()
-            && let Err(e) = modrinth_install(pid, mc, f, dest, log, seen)
-        {
-            push(log, format!("WARN dependency {pid}: {e}"));
+
+    /// A missing required mod is an error: the server usually won't start without it.
+    fn finish(self, what: &str) -> Result<(), String> {
+        if self.missing.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "{what} was added, but required mods it needs couldn't be: {}. Add them from their pages before starting the server.",
+            self.missing.join("; ")
+        ))
+    }
+
+    fn mr_project(&mut self, id: &str) -> Result<(), String> {
+        let loaders = serde_json::to_string(loaders(self.f)).map_err(s)?;
+        let game = enc(&format!("[\"{}\"]", self.mc));
+        let vs = get_json(&format!("{MR}/project/{}/version?game_versions={game}&loaders={}", enc(id), enc(&loaders)))?;
+        let v = pick_version(&vs).ok_or(format!("no {:?} version for Minecraft {}", self.f, self.mc))?;
+        self.mr_version(v)
+    }
+
+    /// Before installing a project: the mods of it already in `dest`. Skips (returns None) a
+    /// dependency that is already installed; the mod the user asked for replaces its old versions.
+    fn existing(&self, top: bool, same: Vec<PathBuf>) -> Option<Vec<PathBuf>> {
+        match same.iter().find(|p| p.extension().is_some_and(|x| x == "jar")) {
+            Some(p) if !top => {
+                push(self.log, format!("{} is already installed", p.file_name().unwrap_or_default().to_string_lossy()));
+                None
+            }
+            _ => Some(same),
         }
     }
-    Ok(())
+
+    /// Move the old versions of a just-installed mod to the old folder.
+    fn replace(&self, old: Vec<PathBuf>, new: &Path) -> Result<(), String> {
+        for p in old.into_iter().filter(|p| p != new) {
+            push(
+                self.log,
+                format!(
+                    "Moving the old version {} to {}",
+                    p.file_name().unwrap_or_default().to_string_lossy(),
+                    old_dir(self.dest).display()
+                ),
+            );
+            shelve(&p)?;
+        }
+        Ok(())
+    }
+
+    fn mr_version(&mut self, v: &Value) -> Result<(), String> {
+        let pid = v["project_id"].as_str().unwrap_or("").to_string();
+        // nothing seen yet: this is the mod the user asked for, not a dependency
+        let top = self.seen.is_empty();
+        if !self.seen.insert(format!("mr:{pid}")) {
+            return Ok(());
+        }
+        let installed = self.installed.get_or_insert_with(|| mr_projects(&mod_files(self.dest)).unwrap_or_default());
+        let same = installed.iter().filter(|(_, p)| *p == pid).map(|(f, _)| f.clone()).collect();
+        let Some(old) = self.existing(top, same) else { return Ok(()) };
+        let file = primary_file(v).ok_or("version has no files")?;
+        let name = url_file_name(file["filename"].as_str().unwrap_or("mod.jar"));
+        push(self.log, format!("Installing {name}"));
+        std::fs::create_dir_all(self.dest).map_err(s)?;
+        download(file["url"].as_str().ok_or("no file url")?, &self.dest.join(&name))?;
+        self.replace(old, &self.dest.join(&name))?;
+        for d in v["dependencies"].as_array().into_iter().flatten().filter(|d| d["dependency_type"] == "required") {
+            // the author's pinned version if there is one, otherwise the newest compatible one
+            let r = match (d["version_id"].as_str(), d["project_id"].as_str()) {
+                (Some(vid), _) => get_json(&format!("{MR}/version/{}", enc(vid))).and_then(|dv| self.mr_version(&dv)),
+                (None, Some(pid)) => self.mr_project(pid),
+                _ => continue,
+            };
+            if let Err(e) = r {
+                let id = d["project_id"].as_str().or(d["version_id"].as_str()).unwrap_or("?");
+                let title = get_json(&format!("{MR}/project/{}", enc(id))).ok().and_then(|p| p["title"].as_str().map(String::from));
+                self.missing_dep(title.as_deref().unwrap_or(id), e);
+            }
+        }
+        Ok(())
+    }
+
+    fn missing_dep(&mut self, name: &str, e: String) {
+        push(self.log, format!("WARN required mod {name}: {e}"));
+        self.missing.push(format!("{name} ({e})"));
+    }
+
+    /// `file`: a specific file id, otherwise the newest one for this server's version and loader.
+    fn cf_mod(&mut self, pid: u64, file: Option<u64>) -> Result<(), String> {
+        let top = self.seen.is_empty();
+        if !self.seen.insert(format!("cf:{pid}")) {
+            return Ok(());
+        }
+        let (mc, f) = (self.mc, self.f);
+        let files = cf_files(pid, |fs| fs.iter().any(|x| file.map_or(cf_matches(x, mc, f), |id| x["id"] == id)))?;
+        let file = match file {
+            Some(id) => files.iter().find(|x| x["id"] == id),
+            None => {
+                let ok: Vec<_> = files.iter().filter(|x| cf_matches(x, mc, f)).collect();
+                ok.iter().find(|x| x["releaseType"] == 1).or(ok.first()).copied()
+            }
+        }
+        .ok_or(format!("no {f:?} file for Minecraft {mc}"))?;
+        // Same project = a jar named like one of its files (without a key there's no fingerprint
+        // lookup). ponytail: only the file pages fetched above are compared, so a very old
+        // installed version can be missed.
+        let names: HashSet<String> = files.iter().filter_map(|x| x["fileName"].as_str()).map(url_file_name).collect();
+        let same = mod_files(self.dest)
+            .into_iter()
+            .filter(|p| names.contains(p.file_name().unwrap_or_default().to_string_lossy().trim_end_matches(".disabled")))
+            .collect();
+        let Some(old) = self.existing(top, same) else { return Ok(()) };
+        let fid = file["id"].as_u64().unwrap_or(0);
+        let url = cf_download_url(pid, fid)?;
+        let name = url_file_name(&url);
+        push(self.log, format!("Installing {name}"));
+        std::fs::create_dir_all(self.dest).map_err(s)?;
+        download(&url, &self.dest.join(&name))?;
+        self.replace(old, &self.dest.join(&name))?;
+        let deps = match get_json(&format!("{CF}/{pid}/files/{fid}/dependencies?pageSize=50")) {
+            Ok(d) => d,
+            Err(e) => {
+                self.missing_dep("its list of required mods", e);
+                return Ok(());
+            }
+        };
+        for d in deps["data"].as_array().into_iter().flatten().filter(|d| d["type"] == "RequiredDependency") {
+            let Some(id) = d["id"].as_u64() else { continue };
+            if let Err(e) = self.cf_mod(id, None) {
+                self.missing_dep(d["name"].as_str().unwrap_or("?"), e);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Download a Modrinth modpack's .mrpack (newest release, or `version` id/number) to `to`.
@@ -149,6 +295,65 @@ pub struct ModUpdate {
     pub url: String,
 }
 
+fn post_json(url: &str, body: Value) -> Result<Value, String> {
+    ureq::post(url).header("User-Agent", UA).send_json(body).map_err(s)?.body_mut().with_config().limit(50 << 20).read_json().map_err(s)
+}
+
+/// Mods in `dir`, disabled ones (`.jar.disabled`) included.
+pub fn mod_files(dir: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && [".jar", ".jar.disabled"].iter().any(|x| p.to_string_lossy().ends_with(x)))
+        .collect();
+    v.sort();
+    v
+}
+
+/// Where removed and replaced mods go (`old-mods` next to `mods`), so they can be restored.
+pub fn old_dir(content: &Path) -> PathBuf {
+    content.with_file_name(format!("old-{}", content.file_name().unwrap_or_default().to_string_lossy()))
+}
+
+/// Move a mod into the old folder instead of deleting it. Returns where it went.
+pub fn shelve(file: &Path) -> Result<PathBuf, String> {
+    let old = old_dir(file.parent().ok_or("bad mod path")?);
+    std::fs::create_dir_all(&old).map_err(s)?;
+    let to = old.join(file.file_name().unwrap_or_default());
+    std::fs::rename(file, &to).map_err(s)?;
+    Ok(to)
+}
+
+/// Put a mod from the old folder back into `content`. Whatever replaced it (same Modrinth
+/// project) goes to the old folder in its place, so a restore can itself be undone.
+pub fn restore(old: &Path, content: &Path, log: &Log) -> Result<(), String> {
+    let name = old.file_name().unwrap_or_default();
+    if let Some((_, pid)) = mr_projects(&[old.to_path_buf()]).unwrap_or_default().pop() {
+        for (f, p) in mr_projects(&mod_files(content))? {
+            if p == pid && f.file_name() != Some(name) {
+                push(log, format!("Moving {} to {}", f.file_name().unwrap_or_default().to_string_lossy(), old_dir(content).display()));
+                shelve(&f)?;
+            }
+        }
+    }
+    push(log, format!("Restoring {}", name.to_string_lossy()));
+    std::fs::create_dir_all(content).map_err(s)?;
+    std::fs::rename(old, content.join(name)).map_err(s)
+}
+
+/// Modrinth project id of each file Modrinth knows (matched by sha1).
+fn mr_projects(files: &[PathBuf]) -> Result<Vec<(PathBuf, String)>, String> {
+    let hashed: Vec<(String, &PathBuf)> = files.iter().filter_map(|p| Some((sha1_file(p)?, p))).collect();
+    if hashed.is_empty() {
+        return Ok(vec![]);
+    }
+    let hashes: Vec<&String> = hashed.iter().map(|(h, _)| h).collect();
+    let r = post_json(&format!("{MR}/version_files"), serde_json::json!({ "hashes": hashes, "algorithm": "sha1" }))?;
+    Ok(hashed.into_iter().filter_map(|(h, p)| Some((p.clone(), r[&h]["project_id"].as_str()?.to_string()))).collect())
+}
+
 pub fn sha1_file(p: &Path) -> Option<String> {
     Some(sha1_smol::Sha1::from(std::fs::read(p).ok()?).digest().to_string())
 }
@@ -172,15 +377,7 @@ pub fn check_mod_updates(dir: &Path, mc: &str, f: Flavor) -> Result<Vec<ModUpdat
         "loaders": loaders(f),
         "game_versions": [mc],
     });
-    let r: Value = ureq::post(format!("{MR}/version_files/update"))
-        .header("User-Agent", UA)
-        .send_json(body)
-        .map_err(s)?
-        .body_mut()
-        .with_config()
-        .limit(50 << 20)
-        .read_json()
-        .map_err(s)?;
+    let r = post_json(&format!("{MR}/version_files/update"), body)?;
     Ok(jars
         .into_iter()
         .filter_map(|(hash, file)| {
@@ -199,15 +396,7 @@ pub fn client_only_hashes(hashes: &[String]) -> Result<Vec<String>, String> {
     if hashes.is_empty() {
         return Ok(vec![]);
     }
-    let versions: Value = ureq::post(format!("{MR}/version_files"))
-        .header("User-Agent", UA)
-        .send_json(serde_json::json!({ "hashes": hashes, "algorithm": "sha1" }))
-        .map_err(s)?
-        .body_mut()
-        .with_config()
-        .limit(50 << 20)
-        .read_json()
-        .map_err(s)?;
+    let versions = post_json(&format!("{MR}/version_files"), serde_json::json!({ "hashes": hashes, "algorithm": "sha1" }))?;
     let by_project: Vec<(&String, &str)> = hashes.iter().filter_map(|h| Some((h, versions[h]["project_id"].as_str()?))).collect();
     if by_project.is_empty() {
         return Ok(vec![]);
@@ -219,13 +408,14 @@ pub fn client_only_hashes(hashes: &[String]) -> Result<Vec<String>, String> {
     Ok(by_project.into_iter().filter(|(_, p)| client.contains(p)).map(|(h, _)| h.clone()).collect())
 }
 
-/// Download the new jar next to the old one, then remove the old one.
+/// Move the old jar to the old folder (restorable from the Mods tab), then download the new one.
 pub fn apply_mod_update(u: &ModUpdate, log: &Log) -> Result<(), String> {
     let dir = u.file.parent().ok_or("bad mod path")?;
     push(log, format!("Updating {} to {}", u.file.file_name().unwrap_or_default().to_string_lossy(), u.new_name));
-    download(&u.url, &dir.join(&u.new_name))?;
-    if dir.join(&u.new_name) != u.file {
-        std::fs::remove_file(&u.file).map_err(s)?;
+    let old = shelve(&u.file)?;
+    if let Err(e) = download(&u.url, &dir.join(&u.new_name)) {
+        let _ = std::fs::rename(&old, &u.file);
+        return Err(e);
     }
     Ok(())
 }
@@ -270,15 +460,13 @@ pub fn parse_cf(link: &str) -> Option<CfLink> {
     })
 }
 
-fn cf_project_id(l: &CfLink) -> Result<u64, String> {
-    // cfwidget answers "queued" for projects it hasn't cached yet; retry a bit.
-    for _ in 0..6 {
-        if let Some(id) = get_json(&format!("{CFWIDGET}/{}/{}", enc(&l.class), enc(&l.slug)))?["id"].as_u64() {
-            return Ok(id);
-        }
-        std::thread::sleep(std::time::Duration::from_secs(3));
+pub(crate) fn cf_project_id(l: &CfLink) -> Result<u64, String> {
+    if let Ok(project) = get_json(&format!("{CFWIDGET}/{}/{}", enc(&l.class), enc(&l.slug)))
+        && let Some(id) = project["id"].as_u64().filter(|id| *id > 0)
+    {
+        return Ok(id);
     }
-    Err(format!("couldn't look up CurseForge project {}", l.slug))
+    crate::browser::project_id(&format!("https://www.curseforge.com/minecraft/{}/{}", enc(&l.class), enc(&l.slug)))
 }
 
 /// Newest-first file list; stops early once `done` is satisfied.
@@ -327,28 +515,18 @@ fn cf_matches(file: &Value, mc: &str, f: Flavor) -> bool {
     gv.iter().any(|g| g == mc) && loader_ok
 }
 
-/// Install a CurseForge mod/plugin from its page link into `dest`.
+/// Install a CurseForge mod/plugin from its page link into `dest`, plus its required mods.
 pub fn cf_install_mod(l: &CfLink, mc: &str, f: Flavor, dest: &Path, log: &Log) -> Result<(), String> {
     let pid = cf_project_id(l)?;
-    let files = cf_files(pid, |fs| fs.iter().any(|x| cf_matches(x, mc, f)))?;
-    let file = match l.file {
-        Some(id) => files.iter().find(|x| x["id"] == id),
-        None => {
-            let ok: Vec<_> = files.iter().filter(|x| cf_matches(x, mc, f)).collect();
-            ok.iter().find(|x| x["releaseType"] == 1).or(ok.first()).copied()
-        }
-    }
-    .ok_or(format!("{} has no {f:?} file for Minecraft {mc}", l.slug))?;
-    let url = cf_download_url(pid, file["id"].as_u64().unwrap_or(0))?;
-    let name = url_file_name(&url);
-    push(log, format!("Installing {name}"));
-    std::fs::create_dir_all(dest).map_err(s)?;
-    download(&url, &dest.join(name))
+    let mut i = Install::new(mc, f, dest, log);
+    i.cf_mod(pid, l.file).map_err(|e| format!("{}: {e}", l.slug))?;
+    i.finish(&l.slug)
 }
 
 /// Download a CurseForge modpack to `to`, preferring its Server Files pack.
 /// Returns (flavor, mc) from the file's tags as a fallback hint.
-pub fn cf_modpack(l: &CfLink, to: &Path, log: &Log) -> Result<Option<(Flavor, String)>, String> {
+/// `server_only`: refuse a pack without server files instead of downloading the client pack.
+pub fn cf_modpack(l: &CfLink, to: &Path, server_only: bool, log: &Log) -> Result<Option<(Flavor, String)>, String> {
     let pid = cf_project_id(l)?;
     let files = cf_files(pid, |fs| l.file.is_none_or(|id| fs.iter().any(|x| x["id"] == id)) && !fs.is_empty())?;
     let file = match l.file {
@@ -370,6 +548,12 @@ pub fn cf_modpack(l: &CfLink, to: &Path, log: &Log) -> Result<Option<(Flavor, St
         }
     }
     let server_pack = target.0 != fid || file["isServerPack"] == true;
+    if server_only && !server_pack {
+        return Err(format!(
+            "{} has no server pack on CurseForge, and Octo only downloads server packs. Download the pack yourself and add it under Import, which cleans it into a server.",
+            target.1
+        ));
+    }
     push(log, format!("Downloading {} ({})", target.1, if server_pack { "server pack" } else { "no server pack, using client pack" }));
     download(&cf_download_url(pid, target.0)?, to)?;
     let gv: Vec<&str> = file["gameVersions"].as_array().into_iter().flatten().filter_map(|v| v.as_str()).collect();
@@ -478,10 +662,18 @@ pub fn add_mod(src: &str, mc: &str, f: Flavor, server_dir: &Path, log: &Log) -> 
         cf_install_mod(&l, mc, f, &dest, log)
     } else if src.starts_with("http") && !src.contains("modrinth.com/") {
         std::fs::create_dir_all(&dest).map_err(s)?;
-        download(src, &dest.join(url_file_name(src)))
+        let to = dest.join(url_file_name(src));
+        download(src, &to)?;
+        // a link to a download page saves HTML; a real mod is a zip
+        if std::fs::read(&to).map_err(s)?.starts_with(b"PK") {
+            return Ok(());
+        }
+        let _ = std::fs::remove_file(&to);
+        Err("That link gave a web page, not a mod file. Open it in a browser, copy the direct download link of the .jar, and add that."
+            .into())
     } else {
         let slug = parse_modrinth(src).map(|(s, _)| s).unwrap_or(src.to_string());
-        modrinth_install(&slug, mc, f, &dest, log, &mut HashSet::new())
+        modrinth_install(&slug, mc, f, &dest, log)
     }
 }
 
@@ -507,8 +699,75 @@ mod tests {
         println!("{} -> {}", ups[0].file.display(), ups[0].new_name);
         apply_mod_update(&ups[0], &Log::default()).unwrap();
         assert!(!ups[0].file.exists() && d.join(&ups[0].new_name).exists());
+        assert!(old_dir(&d).join(ups[0].file.file_name().unwrap()).exists(), "old jar kept");
         assert!(check_mod_updates(&d, "1.21.1", Flavor::Fabric).unwrap().is_empty(), "up to date now");
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// Required dependencies come along from both sites.
+    /// cargo test install_deps_live -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn install_deps_live() {
+        let d = std::env::temp_dir().join(format!("octo-deps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let jars = |d: &Path| {
+            let mut v: Vec<String> = std::fs::read_dir(d).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into()).collect();
+            v.sort();
+            v
+        };
+        modrinth_install("modmenu", "1.21.1", Flavor::Fabric, &d.join("mr"), &Log::default()).unwrap();
+        let mr = jars(&d.join("mr"));
+        println!("{mr:?}");
+        assert!(mr.iter().any(|j| j.starts_with("fabric-api")), "{mr:?}");
+        let l = parse_cf("https://www.curseforge.com/minecraft/mc-mods/applied-energistics-2").unwrap();
+        cf_install_mod(&l, "1.21.1", Flavor::NeoForge, &d.join("cf"), &Log::default()).unwrap();
+        let cf = jars(&d.join("cf"));
+        println!("{cf:?}");
+        assert!(cf.iter().any(|j| j.to_lowercase().contains("guideme")), "{cf:?}");
+        let log = Log::default();
+        cf_install_mod(&l, "1.21.1", Flavor::NeoForge, &d.join("cf"), &log).unwrap();
+        assert_eq!(jars(&d.join("cf")), cf, "reinstall adds nothing");
+        assert!(log.lock().unwrap().iter().any(|l| l.contains("guideme") && l.contains("already installed")));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// Installing a mod again replaces its old version instead of adding a second jar, an
+    /// already-installed dependency isn't downloaded again, and a restore swaps back.
+    /// cargo test replace_and_restore_live -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn replace_and_restore_live() {
+        let d = std::env::temp_dir().join(format!("octo-replace-{}", std::process::id())).join("mods");
+        let _ = std::fs::remove_dir_all(d.parent().unwrap());
+        let log = Log::default();
+        let vs = get_json(&format!("{MR}/project/modmenu/version?game_versions=%5B%221.21.1%22%5D")).unwrap();
+        let oldest = vs.as_array().unwrap().last().unwrap();
+        modrinth_install_version(oldest["id"].as_str().unwrap(), "1.21.1", Flavor::Fabric, &d, &log).unwrap();
+        let first = mod_files(&d);
+        modrinth_install("modmenu", "1.21.1", Flavor::Fabric, &d, &log).unwrap();
+        let now = mod_files(&d);
+        let names = |v: &[PathBuf]| v.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect::<Vec<_>>();
+        println!("{:?} -> {:?}, old: {:?}", names(&first), names(&now), names(&mod_files(&old_dir(&d))));
+        assert_eq!(names(&now).iter().filter(|n| n.starts_with("modmenu")).count(), 1);
+        assert_eq!(now.len(), first.len(), "dependencies not doubled");
+        assert!(log.lock().unwrap().iter().any(|l| l.contains("is already installed")));
+        let old = mod_files(&old_dir(&d));
+        assert_eq!(old.len(), 1);
+        restore(&old[0], &d, &log).unwrap();
+        assert!(mod_files(&d).contains(&d.join(old[0].file_name().unwrap())), "old version back");
+        assert_eq!(mod_files(&old_dir(&d)).len(), 1, "the newer one swapped out");
+        std::fs::remove_dir_all(d.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn missing_deps_fail_the_install() {
+        let log = Log::default();
+        let mut i = Install::new("1.21.1", Flavor::Fabric, Path::new("/nowhere"), &log);
+        assert!(Install::new("1.21.1", Flavor::Fabric, Path::new("/nowhere"), &log).finish("x").is_ok());
+        i.missing_dep("Fabric API", "no Fabric version for Minecraft 1.21.1".into());
+        let e = i.finish("Mod Menu").unwrap_err();
+        assert!(e.starts_with("Mod Menu was added, but") && e.contains("Fabric API (no Fabric version"), "{e}");
     }
 
     #[test]

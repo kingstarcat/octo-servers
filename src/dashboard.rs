@@ -25,6 +25,7 @@ pub enum Act {
     Playit,
     Backup,
     ImportWorld,
+    RestoreBackup,
     Delete,
     DeleteWorld,
 }
@@ -218,8 +219,10 @@ pub fn dashboard(ui: &mut egui::Ui, srv: &mut Server, ip: &str, playit: &crate::
             section(&mut c[0], "Memory (RAM)", |ui| {
                 ui.label(RichText::new(format!("{:.1} GB", srv.cfg.ram_mb as f32 / 1024.0)).size(26.0).strong());
                 ui.spacing_mut().slider_width = (ui.available_width() - 90.0).max(60.0);
-                if ui.add(egui::Slider::new(&mut srv.cfg.ram_mb, 1024..=ram_max()).step_by(512.0).suffix(" MB")).changed() {
-                    let _ = srv.save();
+                if ui.add(egui::Slider::new(&mut srv.cfg.ram_mb, 1024..=ram_max()).step_by(512.0).suffix(" MB")).changed()
+                    && let Err(e) = srv.save()
+                {
+                    crate::push(&srv.console, format!("WARN the RAM setting wasn't saved: {e}"));
                 }
                 match crate::server::ram_warning(srv.cfg.ram_mb) {
                     Some(w) => {
@@ -264,8 +267,15 @@ pub fn dashboard(ui: &mut egui::Ui, srv: &mut Server, ip: &str, playit: &crate::
                     act = Some(Act::ImportWorld);
                 }
                 r.on_disabled_hover_text("Stop the server first");
-                if srv.dir.join("backups").is_dir() && ui.button("Open backups").clicked() {
-                    open_folder(&srv.dir.join("backups"));
+                if srv.dir.join("backups").is_dir() {
+                    if ui.button("Open backups").clicked() {
+                        open_folder(&srv.dir.join("backups"));
+                    }
+                    let r = ui.add_enabled(!running && !busy, egui::Button::new("Restore backup"));
+                    if r.clicked() {
+                        act = Some(Act::RestoreBackup);
+                    }
+                    r.on_disabled_hover_text("Stop the server first");
                 }
                 let r = ui.add_enabled(!running && !busy, egui::Button::new(RichText::new("Delete server").color(RED)));
                 if r.clicked() {
@@ -534,7 +544,7 @@ impl Props {
         // Re-read: the server may have (re)written the file since we loaded it.
         let text = props_set(&std::fs::read_to_string(&path).unwrap_or_default(), &edits);
         let n = edits.len();
-        match std::fs::write(&path, text) {
+        match crate::write_atomic(&path, text) {
             Ok(()) => {
                 *self = Props::load(&self.dir.clone());
                 self.msg = format!("Saved {n} change{}.", if n == 1 { "" } else { "s" });

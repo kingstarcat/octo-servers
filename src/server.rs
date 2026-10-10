@@ -100,7 +100,7 @@ pub fn create_with(
         let props = dir.join("server.properties");
         if let Ok(text) = std::fs::read_to_string(&props) {
             let text = crate::dashboard::props_set(&text, &[("white-list", "false"), ("enforce-whitelist", "false")]);
-            std::fs::write(&props, text).map_err(s)?;
+            crate::write_atomic(&props, text)?;
         }
         save(&dir, &cfg)
     })();
@@ -111,7 +111,7 @@ pub fn create_with(
 }
 
 fn save(dir: &Path, cfg: &Config) -> Result<(), String> {
-    std::fs::write(dir.join("octo.json"), serde_json::to_string_pretty(cfg).map_err(s)?).map_err(s)
+    crate::write_atomic(&dir.join("octo.json"), serde_json::to_string_pretty(cfg).map_err(s)?)
 }
 
 impl Server {
@@ -212,7 +212,16 @@ pub fn diagnose(lines: &[String], java: u32, port: u16) -> String {
         "A client-only mod is installed (minimaps, shaders and HUD mods are common ones). Remove it from the mods folder and start again."
             .into()
     } else if has(&["Missing or unsupported mandatory dependencies", "Incompatible mods found", "which is missing", "Missing mods"]) {
-        "A mod is missing something it depends on. The console shows which mod and what it needs.".into()
+        // Fabric: "- Mod 'Mod Menu' (modmenu) 11.0.5 requires any version of fabric-api, which is missing!"
+        // Forge/NeoForge: "Mod ID: 'architectury', Requested by: 'rei', Expected range: ..."
+        let detail = lines.iter().find(|l| l.contains("which is missing") || l.contains("Requested by"));
+        match detail {
+            Some(l) => format!(
+                "A mod is missing something it depends on: {}. Add the missing mod from the Mods tab and start again.",
+                l.trim().trim_start_matches("- ").trim_end_matches('!')
+            ),
+            None => "A mod is missing something it depends on. The console shows which mod and what it needs.".into(),
+        }
     } else if has(&["agree to the EULA"]) {
         "The Minecraft EULA hasn't been accepted for this server. Set eula=true in eula.txt in the server folder.".into()
     } else if has(&["Unable to access jarfile", "Error: Unable to access", "Could not find or load main class"]) {
@@ -498,6 +507,10 @@ mod tests {
                 .contains("newer Java than Java 17")
         );
         assert!(diagnose(&l("random"), 21, 1).contains("stopped unexpectedly"));
+        let fabric =
+            ["Incompatible mods found!", "\t - Mod 'Mod Menu' (modmenu) 11.0.5 requires any version of fabric-api, which is missing!"];
+        let d = diagnose(&fabric.map(String::from), 21, 1);
+        assert!(d.contains(": Mod 'Mod Menu' (modmenu) 11.0.5 requires any version of fabric-api, which is missing. Add"), "{d}");
     }
 
     #[cfg(unix)]

@@ -231,7 +231,7 @@ fn adds_content(jar: &Path) -> bool {
 /// CurseForge (project, file) ids by jar name, from what the launcher recorded: Prism's
 /// `mods/.index/*.pw.toml`, the CurseForge app's `minecraftinstance.json`, ATLauncher's
 /// `instance.json` and GDLauncher's `config.json`.
-fn cf_ids(mods: &Path) -> std::collections::HashMap<String, (u64, u64)> {
+fn cf_ids(mods: &Path) -> CfIds {
     let mut ids = std::collections::HashMap::new();
     for f in std::fs::read_dir(mods.join(".index")).into_iter().flatten().flatten() {
         let Ok(text) = std::fs::read_to_string(f.path()) else { continue };
@@ -267,7 +267,10 @@ fn cf_ids(mods: &Path) -> std::collections::HashMap<String, (u64, u64)> {
 
 /// Copy the instance's mods into `dir/mods`, leaving out client-only ones (their own metadata,
 /// then Modrinth's server_side for the rest). Returns what was left out.
-fn copy_mods(from: &Path, dir: &Path, log: &Log) -> Result<Vec<String>, String> {
+/// CurseForge (project id, file id) by jar file name.
+pub type CfIds = std::collections::HashMap<String, (u64, u64)>;
+
+fn copy_mods(from: &Path, dir: &Path, ids: &CfIds, log: &Log) -> Result<(), String> {
     let all = jars(from);
     let mut client: Vec<PathBuf> = all.iter().filter(|j| says_client_only(j)).cloned().collect();
     let rest: Vec<(String, &PathBuf)> =
@@ -286,7 +289,6 @@ fn copy_mods(from: &Path, dir: &Path, log: &Log) -> Result<Vec<String>, String> 
         }
         Err(e) => push(log, format!("WARN couldn't reach Modrinth ({e}), so only mods that say so themselves are left out")),
     }
-    let ids = cf_ids(from);
     let rest: Vec<(&PathBuf, (u64, u64))> = all
         .iter()
         .filter(|j| !client.contains(j))
@@ -323,7 +325,20 @@ fn copy_mods(from: &Path, dir: &Path, log: &Log) -> Result<Vec<String>, String> 
         std::fs::copy(j, dest.join(j.file_name().unwrap_or_default())).map_err(|e| format!("{}: {e}", j.display()))?;
     }
     push(log, format!("Copied {} mods", all.len() - client.len()));
-    Ok(client.iter().map(|j| j.file_name().unwrap_or_default().to_string_lossy().into_owned()).collect())
+    if !client.is_empty() {
+        let names: Vec<_> = client.iter().map(|j| j.file_name().unwrap_or_default().to_string_lossy()).collect();
+        push(log, format!("Moved {} client-only mods to {CLIENT_ONLY}: {}", client.len(), names.join(", ")));
+    }
+    Ok(())
+}
+
+/// Filter client-only mods out of `dir/mods` in place (into `CLIENT_ONLY`), e.g. after a
+/// CurseForge client pack's mods were downloaded.
+pub fn clean_mods(dir: &Path, ids: &CfIds, log: &Log) -> Result<(), String> {
+    let tmp = dir.join("_client_mods");
+    std::fs::rename(dir.join("mods"), &tmp).map_err(s)?;
+    copy_mods(&tmp, dir, ids, log)?;
+    std::fs::remove_dir_all(&tmp).map_err(s)
 }
 
 /// Where left-out mods go, so they can be put back by hand or by `test_start`.
@@ -545,10 +560,7 @@ pub fn import(src: &Path, dir: &Path, with_mods: bool, log: &Log) -> Result<Dete
 
 /// Mods (minus client-only ones) and configs from instance game folder `g` into server `dir`.
 fn copy_instance(g: &Path, mods: &Path, dir: &Path, log: &Log) -> Result<(), String> {
-    let left_out = copy_mods(mods, dir, log)?;
-    if !left_out.is_empty() {
-        push(log, format!("Moved {} client-only mods to {CLIENT_ONLY}: {}", left_out.len(), left_out.join(", ")));
-    }
+    copy_mods(mods, dir, &cf_ids(mods), log)?;
     for extra in ["config", "defaultconfigs", "kubejs", "scripts"] {
         if g.join(extra).is_dir() {
             std::fs::create_dir_all(dir.join(extra)).map_err(s)?;
@@ -807,9 +819,8 @@ mod tests {
         let mods = PathBuf::from(std::env::var_os("OCTO_MODS").expect("set OCTO_MODS"));
         let out = std::env::temp_dir().join(format!("octo-filter-{}", std::process::id()));
         let log = Log::default();
-        let r = copy_mods(&mods, &out, &log);
+        copy_mods(&mods, &out, &cf_ids(&mods), &log).unwrap();
         log.lock().unwrap().iter().for_each(|l| println!("{l}"));
-        println!("Left out: {}", r.unwrap().join(", "));
         std::fs::remove_dir_all(&out).unwrap();
     }
 
@@ -869,7 +880,7 @@ mod tests {
         let src = pack.to_string_lossy().into_owned();
         for (clean, out) in [(false, d.join("a")), (true, d.join("b"))] {
             std::fs::create_dir_all(&out).unwrap();
-            let got = crate::packs::import(&src, &out, None, clean, &Log::default());
+            let got = crate::packs::import(&src, &out, None, clean, false, &Log::default());
             if !clean {
                 assert_eq!(got.unwrap_err(), crate::packs::CLIENT_PACK);
                 continue;

@@ -108,15 +108,18 @@ pub fn install(f: Flavor, mc: &str, loader: Option<&str>, dir: &Path, java: &Pat
             let meta = get_json(url.ok_or("unknown version")?)?;
             let url = meta["downloads"]["server"]["url"].as_str().ok_or("this version has no server jar")?;
             push(log, format!("Downloading {url}"));
-            download(url, &jar)
+            download(url, &jar)?;
+            meta["downloads"]["server"]["sha1"].as_str().map_or(Ok(()), |h| crate::verify(&jar, h))
         }
         Flavor::Paper => {
             let builds = get_json(&format!("{PAPER}/versions/{mc}/builds"))?;
             let list = builds.as_array().ok_or("no Paper builds")?;
             let b = list.iter().find(|b| b["channel"] == "STABLE").or(list.first()).ok_or("no Paper builds")?;
-            let url = b["downloads"]["server:default"]["url"].as_str().ok_or("bad Paper build")?;
+            let dl = &b["downloads"]["server:default"];
+            let url = dl["url"].as_str().ok_or("bad Paper build")?;
             push(log, format!("Downloading Paper build {}", b["id"]));
-            download(url, &jar)
+            download(url, &jar)?;
+            dl["checksums"]["sha256"].as_str().map_or(Ok(()), |h| crate::verify(&jar, h))
         }
         Flavor::Fabric => {
             let first_stable = |what: &str| -> Result<String, String> {
@@ -233,6 +236,21 @@ mod tests {
 
 #[cfg(test)]
 mod e2e {
+    /// Vanilla and Paper jars are checked against the hash their APIs publish.
+    /// cargo test server_jars_live -- --ignored
+    #[test]
+    #[ignore]
+    fn server_jars_live() {
+        let d = std::env::temp_dir().join(format!("octo-jars-{}", std::process::id()));
+        for f in [Flavor::Vanilla, Flavor::Paper] {
+            let dir = d.join(format!("{f:?}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            install(f, "1.21.1", None, &dir, Path::new("java"), &Log::default()).unwrap();
+            assert!(std::fs::metadata(dir.join("server.jar")).unwrap().len() > 1 << 20);
+        }
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
     use super::*;
     #[test]
     #[ignore]

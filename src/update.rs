@@ -8,6 +8,8 @@ const REPO: &str = "kingstarcat/octo-servers";
 pub struct Release {
     pub version: String,
     pub url: String,
+    /// GitHub's sha256 of the asset (older releases may not have one)
+    pub sha256: Option<String>,
 }
 
 /// Release asset for this platform.
@@ -27,9 +29,9 @@ pub fn check() -> Result<Option<Release>, String> {
     if !newer(&version, env!("CARGO_PKG_VERSION")) {
         return Ok(None);
     }
-    let url =
-        r["assets"].as_array().into_iter().flatten().find(|a| a["name"] == asset_name()).and_then(|a| a["browser_download_url"].as_str());
-    Ok(url.map(|u| Release { version, url: u.to_string() }))
+    let Some(a) = r["assets"].as_array().into_iter().flatten().find(|a| a["name"] == asset_name()) else { return Ok(None) };
+    let sha256 = a["digest"].as_str().and_then(|d| d.strip_prefix("sha256:")).map(String::from);
+    Ok(a["browser_download_url"].as_str().map(|u| Release { version, url: u.to_string(), sha256 }))
 }
 
 /// Download the new build and put it where the running exe is. Windows lets a running exe be
@@ -42,6 +44,9 @@ fn install_to(r: &Release, exe: PathBuf, log: &Log) -> Result<PathBuf, String> {
     let (new, old) = (exe.with_extension("new"), exe.with_extension("old"));
     push(log, format!("Downloading Octo Servers {}", r.version));
     download(&r.url, &new)?;
+    if let Some(h) = &r.sha256 {
+        crate::verify(&new, h)?;
+    }
     #[cfg(unix)]
     std::fs::set_permissions(&new, std::os::unix::fs::PermissionsExt::from_mode(0o755)).map_err(s)?;
     let _ = std::fs::remove_file(&old);
@@ -83,7 +88,19 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         let exe = d.join("octo.exe");
         std::fs::write(&exe, "old build").unwrap();
-        let r = Release { version: "9.9.9".into(), url: "https://raw.githubusercontent.com/rust-lang/rust/master/README.md".into() };
+        // a download that doesn't match GitHub's digest never replaces the exe
+        let bad = Release {
+            version: "9.9.9".into(),
+            url: "https://raw.githubusercontent.com/rust-lang/rust/master/README.md".into(),
+            sha256: Some("0".repeat(64)),
+        };
+        assert!(install_to(&bad, exe.clone(), &Log::default()).unwrap_err().contains("checksum"));
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "old build");
+        let r = Release {
+            version: "9.9.9".into(),
+            url: "https://raw.githubusercontent.com/rust-lang/rust/master/README.md".into(),
+            sha256: None,
+        };
         install_to(&r, exe.clone(), &Log::default()).unwrap();
         assert!(std::fs::read_to_string(&exe).unwrap().contains("Rust"), "new build in place");
         assert_eq!(std::fs::read_to_string(d.join("octo.old")).unwrap(), "old build");
@@ -97,7 +114,11 @@ mod tests {
     #[ignore]
     fn swaps_running_exe() {
         let exe = std::env::current_exe().unwrap();
-        let r = Release { version: "9.9.9".into(), url: "https://raw.githubusercontent.com/rust-lang/rust/master/README.md".into() };
+        let r = Release {
+            version: "9.9.9".into(),
+            url: "https://raw.githubusercontent.com/rust-lang/rust/master/README.md".into(),
+            sha256: None,
+        };
         install_to(&r, exe.clone(), &Log::default()).unwrap();
         assert!(std::fs::read_to_string(&exe).unwrap().contains("Rust"));
         assert!(exe.with_extension("old").exists());

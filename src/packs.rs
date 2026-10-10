@@ -14,7 +14,16 @@ pub const CLIENT_PACK: &str = "This is the client (launcher) version of the pack
 
 /// `over` = type + MC version the user picked manually (wins over detection).
 /// `clean` = import a client launcher instance, leaving out its client-only mods.
-pub fn import(src: &str, dir: &Path, over: Option<(Flavor, String)>, clean: bool, log: &Log) -> Result<Detected, String> {
+/// `server_only`: from a download tab, which only installs server packs; a client pack is refused
+/// there instead of offered for cleaning.
+pub fn import(
+    src: &str,
+    dir: &Path,
+    over: Option<(Flavor, String)>,
+    clean: bool,
+    server_only: bool,
+    log: &Log,
+) -> Result<Detected, String> {
     let src = src.trim().trim_matches('"');
     if let Some(safe) = sources::parse_atl(src) {
         let (f, mc, loader) = atl_pack(&safe, dir, log)?;
@@ -26,7 +35,7 @@ pub fn import(src: &str, dir: &Path, over: Option<(Flavor, String)>, clean: bool
     let zip = dir.join("_download.zip");
     let mut hint = None;
     if let Some(l) = sources::parse_cf(src) {
-        hint = sources::cf_modpack(&l, &zip, log)?;
+        hint = sources::cf_modpack(&l, &zip, server_only, log)?;
     } else if let Some((slug, ver)) = sources::parse_modrinth(src) {
         sources::modrinth_modpack(&slug, ver.as_deref(), &zip, log)?;
     } else if let Some(slug) = sources::parse_technic(src) {
@@ -50,16 +59,19 @@ pub fn import(src: &str, dir: &Path, over: Option<(Flavor, String)>, clean: bool
         std::fs::remove_file(&zip).map_err(s)?;
     }
 
-    // A launcher instance (MultiMC / Prism / ATLauncher export) is the *client* pack: it has
-    // client-only mods and no server files, so only import it once the user agrees to clean it.
-    let detected = if ["mmc-pack.json", "instance.cfg", "instance.json"].iter().any(|f| dir.join(f).exists()) {
-        if !clean {
-            return Err(CLIENT_PACK.into());
-        }
+    // A launcher instance (MultiMC / Prism / ATLauncher export) or a CurseForge pack without
+    // server files is the *client* pack: it has client-only mods and no server files, so only
+    // import it once the user agrees to clean it.
+    let instance = ["mmc-pack.json", "instance.cfg", "instance.json"].iter().any(|f| dir.join(f).exists());
+    let manifest = cf_manifest(dir);
+    if (instance || manifest.is_some()) && !clean {
+        return Err(if server_only { NOT_SERVER_PACK.into() } else { CLIENT_PACK.into() });
+    }
+    let detected = if instance {
         Some(crate::worlds::clean_instance(dir, log)?)
     } else if dir.join("modrinth.index.json").exists() {
         Some(mrpack(dir, log)?)
-    } else if let Some(m) = cf_manifest(dir) {
+    } else if let Some(m) = manifest {
         Some(cf_client_pack(dir, &m, log)?)
     } else {
         detect(dir)
@@ -175,6 +187,7 @@ pub fn extract(zip: &Path, dir: &Path, log: &Log) -> Result<(), String> {
             && names.iter().flatten().all(|n| first(n).as_ref() == Some(w) && n.components().count() > 1 || n == Path::new(w))
     });
     push(log, format!("Extracting {} files...", a.len()));
+    let mut lost = vec![];
     for (i, name) in names.iter().enumerate() {
         let Some(name) = name else { continue };
         let rel = match &wrapper {
@@ -193,12 +206,18 @@ pub fn extract(zip: &Path, dir: &Path, log: &Log) -> Result<(), String> {
                 .map_or(Ok(()), std::fs::create_dir_all)
                 .and_then(|_| std::io::copy(&mut f, &mut std::fs::File::create(&out)?).map(|_| ()))
         };
-        // e.g. a name Windows can't hold (':' '?' …) — skip that file rather than failing the whole import
+        // e.g. a name Windows can't hold (':' '?' …): skipping a readme is fine, a jar is not
         if let Err(e) = r {
             push(log, format!("WARN skipped {}: {e}", rel.display()));
+            if rel.extension().is_some_and(|x| x == "jar") {
+                lost.push(rel.display().to_string());
+            }
         }
     }
-    Ok(())
+    if lost.is_empty() {
+        return Ok(());
+    }
+    Err(format!("{} couldn't be extracted, and the server needs them. Check there's enough disk space, then try again.", lost.join(", ")))
 }
 
 /// Move everything in `src` into `dst` (merging folders), then remove `src`.
@@ -217,10 +236,22 @@ fn move_into(src: &Path, dst: &Path) -> Result<(), String> {
     std::fs::remove_dir_all(src).map_err(s)
 }
 
-fn finish_downloads(failed: usize, log: &Log) {
-    if failed > 0 {
-        push(log, format!("WARN {failed} file(s) failed to download. The server may still work; the log above lists them."));
+/// A download tab found a client pack (Octo only downloads server packs).
+pub const NOT_SERVER_PACK: &str = "This download is the client version of the pack, and Octo only downloads server packs. Download the pack yourself and add it under Import, which cleans it into a server.";
+
+/// Start of the error when pack files are missing; the GUI offers a retry for it.
+pub const DOWNLOAD_FAILED: &str = "Some of the pack's files couldn't be downloaded";
+
+/// A pack missing files usually won't start, so that fails the import.
+fn finish_downloads(failed: Vec<String>) -> Result<(), String> {
+    if failed.is_empty() {
+        return Ok(());
     }
+    let more = if failed.len() > 5 { format!(" and {} more", failed.len() - 5) } else { String::new() };
+    Err(format!(
+        "{DOWNLOAD_FAILED} ({}{more}). Check your internet connection and retry the import.",
+        failed.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+    ))
 }
 
 /// Modrinth .mrpack: download server-side files, apply overrides.
@@ -243,11 +274,11 @@ fn mrpack(dir: &Path, log: &Log) -> Result<Detected, String> {
         let path = f["path"].as_str().unwrap_or("");
         let to = safe_join(dir, path).ok_or(format!("modpack has an unsafe path: {path}"))?;
         if let Some(url) = f["downloads"][0].as_str() {
-            jobs.push((url.to_string(), to));
+            jobs.push((url.to_string(), to, f["hashes"]["sha1"].as_str().map(String::from)));
         }
     }
     push(log, format!("Downloading {} server-side files...", jobs.len()));
-    finish_downloads(download_all(jobs, log), log);
+    finish_downloads(download_all(jobs, log))?;
     for o in ["overrides", "server-overrides"] {
         if dir.join(o).is_dir() {
             move_into(&dir.join(o), dir)?;
@@ -270,9 +301,10 @@ fn atl_pack(safe: &str, dir: &Path, log: &Log) -> Result<Detected, String> {
         }
         None => (Flavor::Vanilla, None),
     };
-    let jobs = atl_jobs(&c, &mc, dir, log)?;
+    let (jobs, mut failed) = atl_jobs(&c, &mc, dir, log)?;
     push(log, format!("Downloading {} server-side files...", jobs.len()));
-    finish_downloads(download_all(jobs, log), log);
+    failed.extend(download_all(jobs, log));
+    finish_downloads(failed)?;
     if c["noConfigs"] != true {
         push(log, "Downloading configs...");
         let zip = dir.join("_configs.zip");
@@ -285,9 +317,10 @@ fn atl_pack(safe: &str, dir: &Path, log: &Log) -> Result<Detected, String> {
 }
 
 /// Where each server-side mod in an ATLauncher config comes from and goes to. Optional mods are
-/// included when the pack recommends them, like ATLauncher's own install.
-fn atl_jobs(c: &Value, mc: &str, dir: &Path, log: &Log) -> Result<Vec<(String, PathBuf)>, String> {
-    let mut jobs = vec![];
+/// included when the pack recommends them, like ATLauncher's own install. Also returns the mods
+/// whose CurseForge download couldn't be resolved.
+fn atl_jobs(c: &Value, mc: &str, dir: &Path, log: &Log) -> Result<(Vec<crate::Job>, Vec<String>), String> {
+    let (mut jobs, mut unresolved) = (vec![], vec![]);
     for m in c["mods"].as_array().into_iter().flatten() {
         let name = m["name"].as_str().unwrap_or("?");
         if m["server"] == false || (m["optional"] == true && m["recommended"] != true) {
@@ -312,6 +345,7 @@ fn atl_jobs(c: &Value, mc: &str, dir: &Path, log: &Log) -> Result<Vec<(String, P
                 Ok(u) => u,
                 Err(e) => {
                     push(log, format!("WARN {name}: {e}"));
+                    unresolved.push(name.to_string());
                     continue;
                 }
             },
@@ -321,9 +355,9 @@ fn atl_jobs(c: &Value, mc: &str, dir: &Path, log: &Log) -> Result<Vec<(String, P
             }
         };
         let to = safe_join(dir, &format!("{sub}/{file}")).ok_or(format!("modpack has an unsafe path: {file}"))?;
-        jobs.push((url, to));
+        jobs.push((url, to, None));
     }
-    Ok(jobs)
+    Ok((jobs, unresolved))
 }
 
 fn cf_manifest(dir: &Path) -> Option<Value> {
@@ -331,7 +365,8 @@ fn cf_manifest(dir: &Path) -> Option<Value> {
     (m["manifestType"] == "minecraftModpack").then_some(m)
 }
 
-/// CurseForge client pack (no server pack offered): download every mod, apply overrides.
+/// CurseForge client pack (no server pack offered): download every mod, apply overrides, then
+/// move client-only mods aside.
 fn cf_client_pack(dir: &Path, m: &Value, log: &Log) -> Result<Detected, String> {
     let mc = m["minecraft"]["version"].as_str().ok_or("manifest has no Minecraft version")?.to_string();
     let loaders = m["minecraft"]["modLoaders"].as_array().cloned().unwrap_or_default();
@@ -341,25 +376,31 @@ fn cf_client_pack(dir: &Path, m: &Value, log: &Log) -> Result<Detected, String> 
     let mods = dir.join("mods");
     let files = m["files"].as_array().cloned().unwrap_or_default();
     push(log, format!("Resolving {} mods on CurseForge...", files.len()));
-    let mut jobs = vec![];
+    let (mut jobs, mut unresolved, mut ids) = (vec![], vec![], crate::worlds::CfIds::new());
     for f in &files {
         let (p, id) = (f["projectID"].as_u64().unwrap_or(0), f["fileID"].as_u64().unwrap_or(0));
         match sources::cf_download_url(p, id) {
-            Ok(url) => jobs.push((url.clone(), mods.join(crate::url_file_name(&url)))),
-            Err(e) => push(log, format!("WARN {e}")),
+            Ok(url) => {
+                ids.insert(crate::url_file_name(&url), (p, id));
+                jobs.push((url.clone(), mods.join(crate::url_file_name(&url)), None));
+            }
+            Err(e) => {
+                push(log, format!("WARN {e}"));
+                unresolved.push(format!("CurseForge file {id}"));
+            }
         }
     }
-    finish_downloads(download_all(jobs, log), log);
+    unresolved.extend(download_all(jobs, log));
+    finish_downloads(unresolved)?;
     let overrides = m["overrides"].as_str().unwrap_or("overrides");
     if let Some(o) = safe_join(dir, overrides).filter(|o| o.is_dir()) {
         move_into(&o, dir)?;
     }
     let _ = std::fs::remove_file(dir.join("manifest.json"));
     let _ = std::fs::remove_file(dir.join("modlist.html"));
-    push(
-        log,
-        "This pack has no server version, so it may include client-only mods. If the server crashes on start, remove those (minimaps, shaders and similar) from the mods folder.",
-    );
+    if mods.is_dir() {
+        crate::worlds::clean_mods(dir, &ids, log)?;
+    }
     Ok((flavor, mc, (!ver.is_empty()).then(|| ver.to_string())))
 }
 
@@ -511,15 +552,16 @@ mod tests {
         )
         .unwrap();
         let (d, log) = (Path::new("/srv/s"), Log::default());
-        let jobs = atl_jobs(&c, "1.12.2", d, &log).unwrap();
+        let (jobs, unresolved) = atl_jobs(&c, "1.12.2", d, &log).unwrap();
         assert_eq!(
             jobs,
             [
-                (format!("{}/packs/P/files/%5B1.21%5D%20create%20v1.jar", sources::ATL_CDN), d.join("mods/create.jar")),
-                ("https://mediafilez.forgecdn.net/files/1/2/extra.jar".into(), d.join("mods/extra.jar")),
-                ("https://x/lib.jar".into(), d.join("mods/1.12.2/lib.jar")),
+                (format!("{}/packs/P/files/%5B1.21%5D%20create%20v1.jar", sources::ATL_CDN), d.join("mods/create.jar"), None),
+                ("https://mediafilez.forgecdn.net/files/1/2/extra.jar".into(), d.join("mods/extra.jar"), None),
+                ("https://x/lib.jar".into(), d.join("mods/1.12.2/lib.jar"), None),
             ]
         );
+        assert!(unresolved.is_empty());
         assert!(log.lock().unwrap().iter().any(|l| l.contains("Manual has to be downloaded by hand: https://example.com/m")));
     }
 
@@ -532,7 +574,7 @@ mod tests {
         let hits = sources::atl_search("all the forge").unwrap();
         let safe = hits.iter().find_map(|h| sources::parse_atl(&h.slug)).unwrap();
         let (_, c) = sources::atl_config(&safe).unwrap();
-        let jobs = atl_jobs(&c, c["minecraft"].as_str().unwrap(), Path::new("/srv/s"), &Log::default()).unwrap();
+        let (jobs, _) = atl_jobs(&c, c["minecraft"].as_str().unwrap(), Path::new("/srv/s"), &Log::default()).unwrap();
         assert!(jobs.len() > 50, "{safe}: {} jobs", jobs.len());
         let probe = std::env::temp_dir().join(format!("octo-atl-{}.jar", std::process::id()));
         crate::download(&jobs[0].0, &probe).unwrap();
@@ -569,6 +611,35 @@ mod tests {
 mod e2e {
     use super::*;
 
+    /// A CurseForge pack without server files (Fabulously Optimized): refused from a download
+    /// tab; from Import it needs the clean prompt, then comes out with client-only mods moved aside.
+    /// cargo test cf_client_pack_live -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn cf_client_pack_live() {
+        let d = std::env::temp_dir().join(format!("octo-cfclient-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        // by id: cfwidget doesn't resolve this pack's slug
+        let zip = d.join("fo.zip");
+        crate::download(&sources::cf_download_url(396246, 8872574).unwrap(), &zip).unwrap();
+        let src = zip.to_string_lossy().into_owned();
+        let fresh = |n: &str| {
+            let p = d.join(n);
+            std::fs::create_dir_all(&p).unwrap();
+            p
+        };
+        assert_eq!(import(&src, &fresh("dl"), None, false, true, &Log::default()).unwrap_err(), NOT_SERVER_PACK);
+        assert_eq!(import(&src, &fresh("ask"), None, false, false, &Log::default()).unwrap_err(), CLIENT_PACK);
+        let (dir, log) = (fresh("clean"), Log::default());
+        let r = import(&src, &dir, None, true, false, &log);
+        log.lock().unwrap().iter().filter(|l| l.contains("client-only") || l.contains("WARN")).for_each(|l| println!("{l}"));
+        assert_eq!(r.unwrap().0, Flavor::Fabric);
+        assert!(std::fs::read_dir(dir.join(crate::worlds::CLIENT_ONLY)).unwrap().count() > 0, "client-only mods moved aside");
+        assert!(!dir.join("_client_mods").exists());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
     /// E2E_DIR=/tmp/x cargo test e2e_import -- --ignored --nocapture
     #[test]
     #[ignore]
@@ -586,7 +657,7 @@ mod e2e {
             let dir = root.join(name);
             std::fs::create_dir_all(&dir).unwrap();
             let log = Log::default();
-            let r = import(src, &dir, None, false, &log);
+            let r = import(src, &dir, None, false, false, &log);
             let mods = std::fs::read_dir(dir.join("mods")).map(|d| d.count()).unwrap_or(0);
             println!("{name}: {r:?} mods={mods}");
             if let Ok((f, mc, l)) = &r {
@@ -627,7 +698,7 @@ mod e2e_local {
     fn e2e_local_pack() {
         let src = std::env::var("E2E_PACK").unwrap();
         let log = Log::default();
-        let r = crate::server::create_with("e2e", 4096, &log, |dir, log| import(&src, dir, None, false, log));
+        let r = crate::server::create_with("e2e", 4096, &log, |dir, log| import(&src, dir, None, false, false, log));
         for l in log.lock().unwrap().iter().filter(|l| !l.starts_with('[')) {
             println!("  {l}");
         }

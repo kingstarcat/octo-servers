@@ -129,29 +129,64 @@ pub fn download(url: &str, to: &Path) -> Result<(), String> {
     r
 }
 
-/// Download many files, `PARALLEL` at a time. Failures are logged and counted, not fatal.
-pub fn download_all(jobs: Vec<(String, PathBuf)>, log: &Log) -> usize {
+/// Check a downloaded file against a sha1 (40 hex digits) or sha256 (64) hash. A mismatch
+/// deletes the file.
+pub fn verify(p: &Path, want: &str) -> Result<(), String> {
+    use sha2::Digest;
+    let data = std::fs::read(p).map_err(s)?;
+    let got =
+        if want.len() == 64 { format!("{:x}", sha2::Sha256::digest(&data)) } else { sha1_smol::Sha1::from(&data).digest().to_string() };
+    if got.eq_ignore_ascii_case(want) {
+        return Ok(());
+    }
+    let _ = std::fs::remove_file(p);
+    Err(format!("{} was damaged in the download (checksum mismatch). Try again.", p.file_name().unwrap_or_default().to_string_lossy()))
+}
+
+/// Write via a temporary file and a rename, so an interrupted write never leaves half a file.
+pub fn write_atomic(p: &Path, contents: impl AsRef<[u8]>) -> Result<(), String> {
+    let tmp = p.with_file_name(format!("{}.part", p.file_name().unwrap_or_default().to_string_lossy()));
+    std::fs::write(&tmp, contents).and_then(|_| std::fs::rename(&tmp, p)).map_err(|e| format!("Couldn't save {}: {e}", p.display()))
+}
+
+/// One `download_all` entry: url, destination, expected sha1 (when the source gives one).
+pub type Job = (String, PathBuf, Option<String>);
+
+/// Download many files, `PARALLEL` at a time, trying each up to 3 times. A file whose sha1
+/// doesn't match is deleted and counts as failed. Returns the names of the files that failed.
+pub fn download_all(jobs: Vec<Job>, log: &Log) -> Vec<String> {
     let total = jobs.len();
     QUEUED.store(total, Ordering::Relaxed);
     let queue = Mutex::new(jobs.into_iter().enumerate());
-    let failed = AtomicUsize::new(0);
+    let failed = Mutex::new(vec![]);
     std::thread::scope(|sc| {
         for _ in 0..PARALLEL.load(Ordering::Relaxed).max(1) {
             sc.spawn(|| {
                 loop {
-                    let Some((i, (url, to))) = queue.lock().unwrap().next() else { break };
+                    let Some((i, (url, to, sha1))) = queue.lock().unwrap().next() else { break };
                     QUEUED.fetch_sub(1, Ordering::Relaxed);
                     let name = to.file_name().unwrap_or_default().to_string_lossy().into_owned();
-                    let r = to.parent().map_or(Ok(()), |p| std::fs::create_dir_all(p).map_err(s)).and_then(|_| download(&url, &to));
+                    let once = || {
+                        to.parent().map_or(Ok(()), |p| std::fs::create_dir_all(p).map_err(s))?;
+                        download(&url, &to)?;
+                        sha1.as_deref().map_or(Ok(()), |h| verify(&to, h))
+                    };
+                    let mut r = once();
+                    for _ in 0..2 {
+                        if r.is_ok() {
+                            break;
+                        }
+                        r = once();
+                    }
                     if let Err(e) = r {
-                        failed.fetch_add(1, Ordering::Relaxed);
                         push(log, format!("[{}/{total}] WARN {name}: {e}", i + 1));
+                        failed.lock().unwrap().push(name);
                     }
                 }
             });
         }
     });
-    failed.into_inner()
+    failed.into_inner().unwrap()
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -174,9 +209,9 @@ impl Settings {
     fn load() -> Self {
         std::fs::read_to_string(Self::path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
     }
-    fn save(&self) {
-        let _ = std::fs::create_dir_all(data_dir());
-        let _ = std::fs::write(Self::path(), serde_json::to_string_pretty(self).unwrap_or_default());
+    fn save(&self) -> Result<(), String> {
+        std::fs::create_dir_all(data_dir()).map_err(s)?;
+        write_atomic(&Self::path(), serde_json::to_string_pretty(self).map_err(s)?)
     }
 }
 
@@ -254,8 +289,30 @@ type Versions = Arc<Mutex<Option<Result<Vec<String>, String>>>>;
 type ModUpdates = Arc<Mutex<Option<Result<Vec<sources::ModUpdate>, String>>>>;
 type Results = Arc<Mutex<Option<Result<Vec<sources::Hit>, String>>>>;
 
-fn search(query: String, kind: &'static str, mc: Option<String>, f: Option<Flavor>) -> Results {
-    spawn_search(move || sources::modrinth_search(&query, kind, mc.as_deref(), f))
+fn search(query: String, kind: &'static str, mc: Option<String>, f: Option<Flavor>, sort: &'static str) -> Results {
+    spawn_search(move || sources::modrinth_search(&query, kind, mc.as_deref(), f, 0, sort))
+}
+
+/// The next page of a Modrinth search, added to the results so far.
+fn search_more(results: &mut Results, query: String, kind: &'static str, mc: Option<String>, f: Option<Flavor>, sort: &'static str) {
+    let Some(Ok(mut v)) = results.lock().unwrap().clone() else { return };
+    *results = spawn_search(move || {
+        let more = sources::modrinth_search(&query, kind, mc.as_deref(), f, v.len(), sort)?;
+        v.extend(more);
+        Ok(v)
+    });
+}
+
+/// Modrinth sort order dropdown; true when it changed.
+fn sort_picker(ui: &mut egui::Ui, id: &str, sort: &mut &'static str) -> bool {
+    let before = *sort;
+    let label = sources::SORTS.iter().find(|(k, _)| k == sort).map_or("", |(_, l)| l);
+    egui::ComboBox::from_id_salt(id).selected_text(label).show_ui(ui, |ui| {
+        for (k, l) in sources::SORTS {
+            ui.selectable_value(sort, k, l);
+        }
+    });
+    *sort != before
 }
 
 type Searches = std::collections::HashMap<Source, (String, Results)>;
@@ -280,10 +337,12 @@ enum Pick {
     Use(String),
     /// double-clicked: open the project page
     Open(String),
+    /// load the next page
+    More,
 }
 
-/// Renders search hits.
-fn hits(ui: &mut egui::Ui, id: &str, results: &Results, button: &str, enabled: bool) -> Option<Pick> {
+/// Renders search hits. `paged`: offer the next page when this one came back full (Modrinth).
+fn hits(ui: &mut egui::Ui, id: &str, results: &Results, button: &str, enabled: bool, paged: bool) -> Option<Pick> {
     if Arc::strong_count(results) > 1 {
         ui.spinner();
         return None;
@@ -324,6 +383,9 @@ fn hits(ui: &mut egui::Ui, id: &str, results: &Results, button: &str, enabled: b
                 r.on_hover_text("Double-click for details");
                 ui.add_space(4.0);
             }
+            if paged && v.len() % sources::PAGE == 0 && ui.button("More results").clicked() {
+                picked = Some(Pick::More);
+            }
         }
     });
     picked
@@ -341,6 +403,7 @@ struct NewDialog {
     link: String,
     query: String,
     results: Results,
+    sort: &'static str,
     /// other providers' query and results, kept while their tab isn't shown
     searches: Searches,
     over_flavor: Option<Flavor>,
@@ -380,6 +443,7 @@ impl NewDialog {
             src: Source::Blank,
             link: String::new(),
             query: String::new(),
+            sort: "relevance",
             results: Default::default(),
             searches: Default::default(),
             over_flavor: None,
@@ -407,7 +471,8 @@ enum Menu {
     Rename,
 }
 
-type PackJob = (String, u32, String, Option<(Flavor, String)>);
+/// (name, RAM, link, manual flavor/version, server packs only)
+type PackJob = (String, u32, String, Option<(Flavor, String)>, bool);
 
 struct App {
     servers: Vec<Server>,
@@ -426,8 +491,10 @@ struct App {
     mod_query: String,
     mod_link: String,
     mod_results: Results,
+    mod_sort: &'static str,
     page: Option<project::Page>,
     cf_search: Option<browser::Search>,
+    cf_projects: Vec<browser::Search>,
     mod_source: Source,
     mod_searches: Searches,
     settings: Settings,
@@ -442,6 +509,9 @@ struct App {
     confirm_import: Option<(String, Vec<worlds::Found>)>,
     /// the last modpack import (name, RAM, source, manual type), to rerun it cleaned
     pack_job: Option<PackJob>,
+    /// `clean` of the last pack import, and whether its failure can be retried
+    pack_clean: bool,
+    retry_pack: bool,
     /// the pack turned out to be a client pack; ask whether to clean it
     ask_clean: bool,
     /// a newer Octo release (filled by the startup check), and whether it's been installed
@@ -452,7 +522,6 @@ struct App {
     mod_updates: ModUpdates,
     /// closing the window hides it to the tray; this is set when the app should really exit
     quitting: bool,
-    #[cfg(windows)]
     tray: Option<tray_icon::TrayIcon>,
 }
 
@@ -475,8 +544,10 @@ impl App {
             mod_query: String::new(),
             mod_link: String::new(),
             mod_results: Default::default(),
+            mod_sort: "relevance",
             page: None,
             cf_search: None,
+            cf_projects: Vec::new(),
             mod_source: Source::Modrinth,
             mod_searches: Default::default(),
             settings: Settings::load(),
@@ -487,13 +558,14 @@ impl App {
             rename: None,
             confirm_import: None,
             pack_job: None,
+            pack_clean: false,
+            retry_pack: false,
             ask_clean: false,
             update: Default::default(),
             update_dismissed: false,
             updated_exe: Default::default(),
             mod_updates: Default::default(),
             quitting: false,
-            #[cfg(windows)]
             tray: tray(),
         };
         PARALLEL.store(app.settings.parallel_downloads, Ordering::Relaxed);
@@ -519,7 +591,10 @@ impl App {
 
     fn start_now(&mut self, i: usize) {
         let srv = &mut self.servers[i];
-        let _ = srv.save();
+        if let Err(e) = srv.save() {
+            // still start: the settings in memory are right, they just won't survive a restart of Octo
+            self.error = Some(format!("{e}. Check that the server folder is writable."));
+        }
         match java::find(srv.cfg.java_major) {
             Some(j) => {
                 if let Err(e) = srv.start(&j) {
@@ -557,6 +632,7 @@ impl App {
                 Err(e) if e == packs::CLIENT_PACK && self.pack_job.is_some() => self.ask_clean = true,
                 Err(e) => {
                     push(&t.log, format!("ERROR: {e}"));
+                    self.retry_pack = self.pack_job.is_some() && e.starts_with(packs::DOWNLOAD_FAILED);
                     self.error = Some(format!("{}: {e}", t.label));
                 }
             }
@@ -609,8 +685,12 @@ impl eframe::App for App {
                 self.start_now(i);
             }
         }
-        #[cfg(windows)]
         if self.tray.is_some() {
+            // the tray lives in GTK on Linux, which only runs when pumped
+            #[cfg(target_os = "linux")]
+            while gtk::events_pending() {
+                gtk::main_iteration_do(false);
+            }
             use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent, menu::MenuEvent};
             let show = |ctx: &egui::Context| {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -642,6 +722,11 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+
+        browser::poll_projects(&mut self.cf_projects, frame);
+        if !self.cf_projects.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
 
         if let Some(search) = &mut self.cf_search {
             ctx.request_repaint_after(Duration::from_millis(50));
@@ -754,6 +839,13 @@ impl eframe::App for App {
                             if ui.small_button("Dismiss").clicked() {
                                 self.error = None;
                             }
+                            if self.retry_pack
+                                && e.contains(packs::DOWNLOAD_FAILED)
+                                && ui.add_enabled(self.task.is_none(), egui::Button::new("Retry import").small()).clicked()
+                            {
+                                self.error = None;
+                                self.import_pack(self.pack_clean);
+                            }
                         });
                     });
                 });
@@ -847,6 +939,19 @@ impl eframe::App for App {
                     let (dir, name) = (s.dir.clone(), s.name.clone());
                     self.run_task(format!("Backing up {name}"), move |log| server::backup(&dir, false, log).map(|_| ()));
                 }
+                Some(Act::RestoreBackup) => {
+                    let s = &self.servers[self.sel];
+                    let (dir, name) = (s.dir.clone(), s.name.clone());
+                    let pick = rfd::FileDialog::new()
+                        .set_title("Pick a backup to restore")
+                        .set_directory(dir.join("backups"))
+                        .add_filter("Backup", &["zip"])
+                        .pick_file();
+                    if let Some(src) = pick {
+                        // import_world backs up the current world first, so a restore can be undone
+                        self.run_task(format!("Restoring a backup of {name}"), move |log| server::import_world(&dir, &src, log));
+                    }
+                }
                 Some(Act::ImportWorld) => self.confirm_import = Some((self.servers[self.sel].name.clone(), worlds::scan())),
                 Some(Act::Delete) => self.confirm_delete = Some(self.servers[self.sel].name.clone()),
                 Some(Act::DeleteWorld) => self.confirm_delete_world = Some(self.servers[self.sel].name.clone()),
@@ -879,13 +984,14 @@ impl App {
         });
         ui.horizontal(|ui| {
             let r = ui.add(egui::TextEdit::singleline(&mut self.mod_query).hint_text("Search Modrinth/CurseForge"));
-            if ui.button("Search").clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+            let resort = self.mod_source == Source::Modrinth && sort_picker(ui, "mod_sort", &mut self.mod_sort);
+            if ui.button("Search").clicked() || resort || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
                 if self.mod_source == Source::CurseForge {
                     self.mod_results = Default::default();
                     let class = if flavor == Flavor::Paper { "bukkit-plugins" } else { "mc-mods" };
                     self.cf_search = Some(browser::Search::new(&self.mod_query, class, Some(&mc), Some(flavor), self.mod_results.clone()));
                 } else {
-                    self.mod_results = search(self.mod_query.clone(), "mod", Some(mc.clone()), Some(flavor));
+                    self.mod_results = search(self.mod_query.clone(), "mod", Some(mc.clone()), Some(flavor), self.mod_sort);
                 }
             }
         });
@@ -905,6 +1011,7 @@ impl App {
         let folder = dir.join(sources::content_dir(flavor));
         // updates for installed mods, matched on Modrinth by file fingerprint
         let mut apply: Option<Vec<sources::ModUpdate>> = None;
+        let mut restore: Option<PathBuf> = None;
         ui.horizontal(|ui| {
             let checking = Arc::strong_count(&self.mod_updates) > 1;
             if ui.add_enabled(!busy && !checking, egui::Button::new("Check for updates")).clicked() {
@@ -945,13 +1052,29 @@ impl App {
         if let Some(list) = apply {
             self.mod_updates = Default::default();
             self.run_task(format!("Updating {} mod(s)", list.len()), move |log| {
-                list.iter().try_for_each(|m| sources::apply_mod_update(m, log))
+                // one failure shouldn't stop the rest
+                let failed: Vec<String> =
+                    list.iter().filter_map(|m| sources::apply_mod_update(m, log).err().map(|e| format!("{} ({e})", m.new_name))).collect();
+                if failed.is_empty() {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "{} of {} updates failed: {}. Check for updates again to retry them.",
+                        failed.len(),
+                        list.len(),
+                        failed.join("; ")
+                    ))
+                }
             });
         }
         ui.columns(2, |cols| {
             let site = if self.mod_source == Source::CurseForge { "CurseForge" } else { "Modrinth" };
             cols[0].strong(format!("{site} results for {flavor:?} {mc}"));
-            match hits(&mut cols[0], "mod_hits", &self.mod_results, "Install", !busy) {
+            let paged = self.mod_source == Source::Modrinth;
+            match hits(&mut cols[0], "mod_hits", &self.mod_results, "Install", !busy, paged) {
+                Some(Pick::More) => {
+                    search_more(&mut self.mod_results, self.mod_query.clone(), "mod", Some(mc.clone()), Some(flavor), self.mod_sort)
+                }
                 Some(Pick::Use(slug)) => add = Some(slug),
                 Some(Pick::Open(slug)) => {
                     if sources::parse_cf(&slug).is_some() {
@@ -964,20 +1087,51 @@ impl App {
                 None => {}
             }
             cols[1].strong("Installed");
-            let mut files: Vec<_> =
-                std::fs::read_dir(&folder).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_file()).collect();
-            files.sort();
+            let old = sources::old_dir(&folder);
             egui::ScrollArea::vertical().id_salt("installed").auto_shrink(false).show(&mut cols[1], |ui| {
-                for f in files {
+                // Remove and Disable only move or rename files, so both can be undone here.
+                for f in sources::mod_files(&folder) {
+                    let name = f.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                    let enabled = name.ends_with(".jar");
                     ui.horizontal(|ui| {
-                        if ui.small_button("Delete").clicked() {
-                            let _ = std::fs::remove_file(&f);
+                        if ui.small_button("Remove").clicked()
+                            && let Err(e) = sources::shelve(&f)
+                        {
+                            self.error = Some(format!("Couldn't remove {name}: {e}"));
+                        }
+                        if ui.small_button(if enabled { "Disable" } else { "Enable" }).clicked() {
+                            let to = if enabled { format!("{name}.disabled") } else { name.trim_end_matches(".disabled").to_string() };
+                            if let Err(e) = std::fs::rename(&f, folder.join(to)) {
+                                self.error = Some(format!("Couldn't rename {name}: {e}"));
+                            }
+                        }
+                        if enabled {
+                            ui.label(&name);
+                        } else {
+                            ui.weak(format!("{} (disabled)", name.trim_end_matches(".disabled")));
+                        }
+                    });
+                }
+                let removed = sources::mod_files(&old);
+                if !removed.is_empty() {
+                    ui.add_space(8.0);
+                    ui.strong("Removed and replaced");
+                    ui.weak(format!("Kept in {}", old.display()));
+                }
+                for f in removed {
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(!busy, egui::Button::new("Restore").small()).clicked() {
+                            restore = Some(f.clone());
                         }
                         ui.label(f.file_name().unwrap_or_default().to_string_lossy());
                     });
                 }
             });
         });
+        if let Some(f) = restore {
+            let name = f.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            self.run_task(format!("Restoring {name}"), move |log| sources::restore(&f, &folder, log));
+        }
         if let Some(src) = add {
             self.run_task(format!("Adding {src}"), move |log| sources::add_mod(&src, &mc, flavor, &dir, log));
         }
@@ -1051,7 +1205,8 @@ impl App {
                                     _ => "Modrinth",
                                 };
                                 let r = ui.add(egui::TextEdit::singleline(&mut d.query).hint_text(format!("Search {site} modpacks")));
-                                if ui.button("Search").clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                                let resort = d.src == Source::Modrinth && sort_picker(ui, "pack_sort", &mut d.sort);
+                                if ui.button("Search").clicked() || resort || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
                                     if d.src == Source::CurseForge {
                                         d.results = Default::default();
                                         self.cf_search = Some(browser::Search::new(&d.query, "modpacks", None, None, d.results.clone()));
@@ -1060,13 +1215,14 @@ impl App {
                                         d.results = match d.src {
                                             Source::Technic => spawn_search(move || sources::technic_search(&q)),
                                             Source::ATLauncher => spawn_search(move || sources::atl_search(&q)),
-                                            _ => search(q, "modpack", None, None),
+                                            _ => search(q, "modpack", None, None, d.sort),
                                         };
                                     }
                                 }
                             });
                             ui.allocate_ui(egui::vec2(ui.available_width(), 220.0), |ui| {
-                                match hits(ui, "pack_hits", &d.results, "Use", true) {
+                                match hits(ui, "pack_hits", &d.results, "Use", true, d.src == Source::Modrinth) {
+                                    Some(Pick::More) => search_more(&mut d.results, d.query.clone(), "modpack", None, None, d.sort),
                                     Some(Pick::Use(slug)) => {
                                         // Modrinth hits are bare slugs; the other sites give the pack's page link
                                         let link = if slug.starts_with("https://") {
@@ -1212,7 +1368,7 @@ impl App {
             }
             if d.src.is_pack() {
                 let over = d.over_flavor.map(|f| (f, d.over_mc.trim().to_string()));
-                self.pack_job = Some((name, d.ram_mb, d.link.trim().to_string(), over));
+                self.pack_job = Some((name, d.ram_mb, d.link.trim().to_string(), over, d.src != Source::Pack));
                 self.import_pack(false);
                 return;
             }
@@ -1447,9 +1603,10 @@ impl App {
     }
 
     fn import_pack(&mut self, clean: bool) {
-        let Some((name, ram, src, over)) = self.pack_job.clone() else { return };
+        let Some((name, ram, src, over, server_only)) = self.pack_job.clone() else { return };
+        (self.pack_clean, self.retry_pack) = (clean, false);
         self.run_task(format!("Importing {name}"), move |log| {
-            server::create_with(&name, ram, log, |dir, log| packs::import(&src, dir, over, clean, log))
+            server::create_with(&name, ram, log, |dir, log| packs::import(&src, dir, over, clean, server_only, log))
         });
     }
 
@@ -1505,19 +1662,23 @@ impl App {
 
     fn settings_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_settings;
+        let mut saved = Ok(());
         egui::Window::new("Settings").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
             let r = ui.add(egui::Slider::new(&mut self.settings.parallel_downloads, 1..=16).text("mods downloaded at once"));
             if r.changed() {
                 PARALLEL.store(self.settings.parallel_downloads, Ordering::Relaxed);
-                self.settings.save();
+                saved = self.settings.save();
             }
             ui.weak("Higher is faster on good connections. Lower it if downloads fail or get rate-limited.");
             if ui.checkbox(&mut self.settings.backup_on_start, "Back up the world before each start").changed() {
-                self.settings.save();
+                saved = self.settings.save();
             }
             ui.weak("Keeps the last 5 automatic backups in each server's backups folder.");
         });
         self.show_settings = open;
+        if let Err(e) = saved {
+            self.error = Some(format!("{e}. Check that the data folder is writable."));
+        }
     }
 }
 
@@ -1534,9 +1695,18 @@ impl Drop for App {
     }
 }
 
-/// Tray icon with Open and Quit. None if Windows refuses it; closing the window then exits as before.
-#[cfg(windows)]
+/// Tray icon with Open and Quit. None if the system has no tray; closing the window then exits as before.
 fn tray() -> Option<tray_icon::TrayIcon> {
+    #[cfg(target_os = "linux")]
+    {
+        // tray-icon panics if neither appindicator library is installed
+        let lib = |name| unsafe { libloading::Library::new(name) }.is_ok();
+        if !lib("libayatana-appindicator3.so.1") && !lib("libappindicator3.so.1") {
+            return None;
+        }
+        gtk::gdk::set_allowed_backends("x11");
+        gtk::init().ok()?;
+    }
     use tray_icon::menu::{Menu, MenuItem};
     let png = image::load_from_memory(include_bytes!("../assets/tray.png")).ok()?.into_rgba8();
     let (w, h) = png.dimensions();
@@ -1746,7 +1916,7 @@ mod tests {
         for parallel in [4, 1] {
             DOWNLOADS.lock().unwrap().clear();
             PARALLEL.store(parallel, Ordering::Relaxed);
-            let jobs = (0..8).map(|i| (url.to_string(), dir.join(format!("{parallel}-{i}.jar")))).collect();
+            let jobs = (0..8).map(|i| (url.to_string(), dir.join(format!("{parallel}-{i}.jar")), None)).collect();
             let max_active = Arc::new(AtomicUsize::new(0));
             let (m, stop) = (max_active.clone(), Arc::new(std::sync::atomic::AtomicBool::new(false)));
             let s2 = stop.clone();
@@ -1763,7 +1933,7 @@ mod tests {
             mon.join().unwrap();
             let d = DOWNLOADS.lock().unwrap();
             println!(
-                "parallel={parallel}: {} files, failed={failed}, max active={}, {:.1}s, first row: {} {}/{} bytes",
+                "parallel={parallel}: {} files, failed={failed:?}, max active={}, {:.1}s, first row: {} {}/{} bytes",
                 d.len(),
                 max_active.load(Ordering::Relaxed),
                 t0.elapsed().as_secs_f64(),
@@ -1771,10 +1941,15 @@ mod tests {
                 d[0].done,
                 d[0].total
             );
-            assert_eq!(failed, 0);
+            assert!(failed.is_empty());
             assert!(max_active.load(Ordering::Relaxed) <= parallel);
             assert!(d.iter().all(|x| x.total > 0 && x.done == x.total && x.end.is_some()));
         }
+        // a wrong checksum fails the file and leaves nothing behind
+        let bad = dir.join("bad.jar");
+        let failed = download_all(vec![(url.to_string(), bad.clone(), Some("0".repeat(40)))], &Log::default());
+        assert_eq!(failed, ["bad.jar"]);
+        assert!(!bad.exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

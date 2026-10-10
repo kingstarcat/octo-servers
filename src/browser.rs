@@ -1,8 +1,10 @@
-//! CurseForge search through a hidden native browser, using its normal TLS, JS and cookies.
+//! CurseForge search and project lookup through a hidden native browser.
 use crate::{Results, data_dir, flavors::Flavor, s, sources};
 use serde_json::Value;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::cell::RefCell;
+use std::collections::VecDeque;
+use std::rc::Rc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 use wry::{WebContext, WebView, WebViewBuilder};
 
@@ -21,20 +23,64 @@ const EXTRACT: &str = r#"(() => {
         empty:/no (results|projects|mods|modpacks) (found|match)/i.test(document.body?.innerText || '')};
 })()"#;
 
+// shortcut: reads the project's Details row; update if CurseForge changes its markup.
+const EXTRACT_PROJECT: &str = r#"(() => {
+    const text = document.querySelector('.project-id')?.textContent.trim() || '';
+    const id = /^\d+$/.test(text) ? Number(text) : null;
+    return {project_id:Number.isSafeInteger(id) && id > 0 ? id : null, url:location.href};
+})()"#;
+
+enum Output {
+    Search { class: &'static str, results: Results },
+    Project(mpsc::SyncSender<Result<u64, String>>),
+}
+
+struct ProjectRequest {
+    url: String,
+    out: mpsc::SyncSender<Result<u64, String>>,
+    deadline: Instant,
+}
+
+static PROJECTS: Mutex<VecDeque<ProjectRequest>> = Mutex::new(VecDeque::new());
+thread_local! {
+    static CONTEXT: RefCell<Option<Rc<RefCell<WebContext>>>> = const { RefCell::new(None) };
+}
+// Automatic browser verification can take over a minute before the page loads.
+const PAGE_TIMEOUT: Duration = Duration::from_secs(150);
+const PROJECT_TIMEOUT: Duration = Duration::from_secs(170);
+
+/// Called by install workers; the app loads the page on its UI thread.
+pub fn project_id(url: &str) -> Result<u64, String> {
+    let uri = url.parse::<wry::http::Uri>().map_err(s)?;
+    if !project_link(url, uri.path().split('/').nth(2).unwrap_or("")) {
+        return Err("Couldn't read the CurseForge link. Paste the project's CurseForge page link and try again.".into());
+    }
+    let (out, result) = mpsc::sync_channel(1);
+    PROJECTS.lock().unwrap().push_back(ProjectRequest { url: url.into(), out, deadline: Instant::now() + PROJECT_TIMEOUT });
+    result.recv_timeout(PROJECT_TIMEOUT).map_err(|_| "Couldn't load the CurseForge project page. Try adding the link again.")?
+}
+
+pub fn poll_projects(active: &mut Vec<Search>, frame: &eframe::Frame) {
+    for request in PROJECTS.lock().unwrap().drain(..) {
+        if request.deadline > Instant::now() {
+            active.push(Search::project(request));
+        }
+    }
+    active.retain_mut(|lookup| !lookup.poll(frame));
+}
+
 pub struct Search {
     // Drop the view before its context.
     view: Option<WebView>,
     #[cfg(target_os = "linux")]
     offscreen: Option<gtk::OffscreenWindow>,
-    context: Option<WebContext>,
+    context: Option<Rc<RefCell<WebContext>>>,
     url: String,
-    class: &'static str,
-    out: Option<Results>,
+    out: Option<Output>,
     snapshot: Arc<Mutex<Option<String>>>,
     started: Instant,
     last_read: Instant,
     reading: bool,
-    loaded: Arc<AtomicBool>,
 }
 
 fn project_link(url: &str, class: &str) -> bool {
@@ -47,11 +93,7 @@ fn project_link(url: &str, class: &str) -> bool {
 }
 
 fn parse_snapshot(raw: &str, class: &str) -> Result<(Vec<sources::Hit>, bool), String> {
-    let mut v: Value = serde_json::from_str(raw).map_err(s)?;
-    // WebView2 and WebKit serialize JavaScript return values differently.
-    if let Some(inner) = v.as_str() {
-        v = serde_json::from_str(inner).map_err(s)?;
-    }
+    let v = snapshot_json(raw)?;
     let rows = v["hits"].as_array().ok_or("Couldn't read CurseForge search results. Try searching again.")?;
     let mut seen = std::collections::HashSet::new();
     let hits = rows
@@ -74,21 +116,47 @@ fn parse_snapshot(raw: &str, class: &str) -> Result<(Vec<sources::Hit>, bool), S
     Ok((hits, v["ready"] == true && v["empty"] == true))
 }
 
+fn snapshot_json(raw: &str) -> Result<Value, String> {
+    let v: Value = serde_json::from_str(raw).map_err(s)?;
+    // WebView2 and WebKit serialize JavaScript return values differently.
+    if let Some(inner) = v.as_str() { serde_json::from_str(inner).map_err(s) } else { Ok(v) }
+}
+
+fn parse_project_snapshot(raw: &str, expected: &str) -> Result<Option<u64>, String> {
+    let v = snapshot_json(raw)?;
+    let Some(id) = v["project_id"].as_u64().filter(|id| *id > 0) else { return Ok(None) };
+    let actual = v["url"].as_str().unwrap_or("");
+    let expected = expected.parse::<wry::http::Uri>().map_err(s)?;
+    let class = expected.path().split('/').nth(2).unwrap_or("");
+    if !project_link(actual, class)
+        || actual.parse::<wry::http::Uri>().map_err(s)?.path().trim_end_matches('/') != expected.path().trim_end_matches('/')
+    {
+        return Err("CurseForge opened a different project page. Check the link and try again.".into());
+    }
+    Ok(Some(id))
+}
+
 impl Search {
     pub fn new(query: &str, class: &'static str, mc: Option<&str>, flavor: Option<Flavor>, out: Results) -> Self {
+        Self::page(sources::cf_search_url(query, class, mc, flavor), Output::Search { class, results: out })
+    }
+
+    fn project(request: ProjectRequest) -> Self {
+        Self::page(request.url, Output::Project(request.out))
+    }
+
+    fn page(url: String, out: Output) -> Self {
         Self {
             view: None,
             #[cfg(target_os = "linux")]
             offscreen: None,
             context: None,
-            url: sources::cf_search_url(query, class, mc, flavor),
-            class,
+            url,
             out: Some(out),
             snapshot: Default::default(),
             started: Instant::now(),
             last_read: Instant::now(),
             reading: false,
-            loaded: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -100,14 +168,19 @@ impl Search {
         }
         let profile = data_dir().join("browser-profile");
         std::fs::create_dir_all(&profile).map_err(s)?;
-        self.context = Some(WebContext::new(Some(std::fs::canonicalize(profile).map_err(s)?)));
-        let loaded = self.loaded.clone();
-        let builder = WebViewBuilder::new_with_web_context(self.context.as_mut().unwrap())
-            .with_visible(false)
-            .with_on_page_load_handler(move |event, _| {
-                loaded.store(matches!(event, wry::PageLoadEvent::Finished), Ordering::Relaxed);
+        let profile = std::fs::canonicalize(profile).map_err(s)?;
+        // Keep live cookies and connections shared between search and install pages.
+        self.context = Some(
+            CONTEXT
+                .with(|context| context.borrow_mut().get_or_insert_with(|| Rc::new(RefCell::new(WebContext::new(Some(profile))))).clone()),
+        );
+        let mut context = self.context.as_ref().unwrap().borrow_mut();
+        let builder = WebViewBuilder::new_with_web_context(&mut context)
+            .with_visible(cfg!(target_os = "linux"))
+            .with_bounds(wry::Rect {
+                position: wry::dpi::LogicalPosition::new(0, 0).into(),
+                size: wry::dpi::LogicalSize::new(1180, 760).into(),
             })
-            .with_bounds(wry::Rect { position: wry::dpi::LogicalPosition::new(0, 0).into(), size: wry::dpi::LogicalSize::new(1, 1).into() })
             .with_navigation_handler(|url| url.parse::<wry::http::Uri>().is_ok_and(|u| matches!(u.scheme_str(), Some("https" | "http"))))
             .with_download_started_handler(|_, _| false);
         #[cfg(not(target_os = "linux"))]
@@ -143,9 +216,14 @@ impl Search {
         Ok(())
     }
 
-    fn finish(&mut self, result: Result<Vec<sources::Hit>, String>) {
+    fn fail(&mut self, error: String) {
         if let Some(out) = self.out.take() {
-            *out.lock().unwrap() = Some(result);
+            match out {
+                Output::Search { results, .. } => *results.lock().unwrap() = Some(Err(error)),
+                Output::Project(out) => {
+                    let _ = out.send(Err(error));
+                }
+            }
         }
     }
 
@@ -157,7 +235,7 @@ impl Search {
         if self.view.is_none()
             && let Err(e) = self.create(frame)
         {
-            self.finish(Err(format!("Couldn't search CurseForge: {e}. Paste a project link or try again.")));
+            self.fail(format!("Couldn't load CurseForge in the background browser: {e}. Try again."));
             return true;
         }
         #[cfg(target_os = "linux")]
@@ -167,28 +245,48 @@ impl Search {
         let raw = self.snapshot.lock().unwrap().take();
         if let Some(raw) = raw {
             self.reading = false;
-            match parse_snapshot(&raw, self.class) {
-                Ok((hits, empty)) if !hits.is_empty() || empty => {
-                    self.finish(Ok(hits));
-                    return true;
+            match self.out.as_ref().unwrap() {
+                Output::Search { class, results } => {
+                    if let Ok((hits, empty)) = parse_snapshot(&raw, class)
+                        && (!hits.is_empty() || empty)
+                    {
+                        *results.lock().unwrap() = Some(Ok(hits));
+                        self.out.take();
+                        return true;
+                    }
                 }
-                _ => {}
+                Output::Project(out) => match parse_project_snapshot(&raw, &self.url) {
+                    Ok(Some(id)) => {
+                        let _ = out.send(Ok(id));
+                        self.out.take();
+                        return true;
+                    }
+                    Err(e) => {
+                        self.fail(e);
+                        return true;
+                    }
+                    Ok(None) => {}
+                },
             }
         }
-        if self.started.elapsed() > Duration::from_secs(45) {
-            self.finish(Err(
-                "CurseForge didn't return search results. It may be asking for browser verification. Try again or paste a project link."
+        if self.started.elapsed() > PAGE_TIMEOUT {
+            self.fail(
+                "CurseForge didn't finish loading in the background browser. It may be asking for browser verification. Try again later."
                     .into(),
-            ));
+            );
             return true;
         }
-        if self.loaded.load(Ordering::Relaxed) && !self.reading && self.last_read.elapsed() > Duration::from_millis(500) {
+        // Read as soon as the DOM contains the ID; ads can delay the page's load event.
+        if !self.reading && self.last_read.elapsed() > Duration::from_millis(500) {
             let out = self.snapshot.clone();
             self.reading = true;
             self.last_read = Instant::now();
-            if let Err(e) = self.view.as_ref().unwrap().evaluate_script_with_callback(EXTRACT, move |raw| *out.lock().unwrap() = Some(raw))
-            {
-                self.finish(Err(format!("Couldn't read CurseForge results: {e}. Try again.")));
+            let script = match self.out.as_ref().unwrap() {
+                Output::Search { .. } => EXTRACT,
+                Output::Project(_) => EXTRACT_PROJECT,
+            };
+            if let Err(e) = self.view.as_ref().unwrap().evaluate_script_with_callback(script, move |raw| *out.lock().unwrap() = Some(raw)) {
+                self.fail(format!("Couldn't read the CurseForge page: {e}. Try again."));
                 return true;
             }
         }
@@ -199,7 +297,7 @@ impl Search {
 impl Drop for Search {
     fn drop(&mut self) {
         if self.out.is_some() {
-            self.finish(Err("Search cancelled. Search again.".into()));
+            self.fail("CurseForge page lookup cancelled. Try again.".into());
         }
         #[cfg(target_os = "linux")]
         if let Some(offscreen) = self.offscreen.take() {
@@ -213,6 +311,38 @@ impl Drop for Search {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reads_project_id_only_from_the_requested_page() {
+        let expected = "https://www.curseforge.com/minecraft/mc-mods/ferritecore";
+        let sample = serde_json::json!({"project_id":429235, "url":expected});
+        for raw in [sample.to_string(), serde_json::to_string(&sample.to_string()).unwrap()] {
+            assert_eq!(parse_project_snapshot(&raw, expected).unwrap(), Some(429235));
+        }
+        for id in [Value::Null, serde_json::json!(0), serde_json::json!(-1), serde_json::json!("429235")] {
+            assert_eq!(parse_project_snapshot(&serde_json::json!({"project_id":id, "url":expected}).to_string(), expected).unwrap(), None);
+        }
+        for url in [
+            "https://evil.test/minecraft/mc-mods/ferritecore",
+            "https://www.curseforge.com/minecraft/mc-mods/simple-voice-chat",
+            "https://www.curseforge.com/minecraft/modpacks/ferritecore",
+        ] {
+            assert!(parse_project_snapshot(&serde_json::json!({"project_id":429235, "url":url}).to_string(), expected).is_err());
+        }
+        assert!(project_id("https://evil.test/minecraft/mc-mods/ferritecore").is_err());
+    }
+
+    #[test]
+    fn closing_a_project_lookup_unblocks_the_worker() {
+        let (out, result) = mpsc::sync_channel(1);
+        let lookup = Search::project(ProjectRequest {
+            url: "https://www.curseforge.com/minecraft/mc-mods/ferritecore".into(),
+            out,
+            deadline: Instant::now() + Duration::from_secs(60),
+        });
+        drop(lookup);
+        assert!(result.try_recv().unwrap().unwrap_err().contains("cancelled"));
+    }
+
     #[test]
     fn reads_results_and_rejects_other_hosts() {
         let sample = serde_json::json!({"hits":[
@@ -237,6 +367,88 @@ mod tests {
 mod live {
     use super::*;
     use eframe::egui;
+
+    /// Run under a separate X server with OCTO_DATA_DIR pointing at a scratch directory.
+    #[test]
+    #[ignore]
+    fn background_curseforge_project_lookup() {
+        struct Probe {
+            active: Vec<Search>,
+            context: Option<Rc<RefCell<WebContext>>>,
+            result: Arc<Mutex<Option<Result<(), String>>>>,
+            started: Instant,
+        }
+        impl eframe::App for Probe {
+            fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+                ui.ctx().request_repaint_after(Duration::from_millis(50));
+                poll_projects(&mut self.active, frame);
+                for lookup in &self.active {
+                    if let Some(context) = &lookup.context {
+                        if let Some(previous) = &self.context {
+                            assert!(Rc::ptr_eq(previous, context), "Lookups must share the browser session");
+                        } else {
+                            self.context = Some(context.clone());
+                        }
+                    }
+                    if let Some(offscreen) = &lookup.offscreen {
+                        use gtk::prelude::*;
+                        assert_eq!(offscreen.window().unwrap().window_type(), gtk::gdk::WindowType::Offscreen);
+                    }
+                }
+                if self.started.elapsed() > Duration::from_secs(1200) {
+                    *self.result.lock().unwrap() = Some(Err("Project lookup test timed out".into()));
+                }
+                if self.result.lock().unwrap().is_some() {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+        let result = Arc::new(Mutex::new(None));
+        let worker_result = result.clone();
+        let worker = std::thread::spawn(move || {
+            let check = || -> Result<(), String> {
+                for (class, slug, expected) in [
+                    ("modpacks", "fabulously-optimized", 396246),
+                    ("mc-mods", "ferritecore", 429235),
+                    ("mc-mods", "simple-voice-chat", 416089),
+                ] {
+                    let url = format!("https://www.curseforge.com/minecraft/{class}/{slug}");
+                    let started = Instant::now();
+                    let browser_id = project_id(&url)?;
+                    println!("{slug}: browser lookup took {:.1}s", started.elapsed().as_secs_f32());
+                    if browser_id != expected {
+                        return Err(format!("{slug}: expected {expected}, browser got {browser_id}"));
+                    }
+                    // Exercise the real cfwidget miss as well as the browser queue used by installers.
+                    let started = Instant::now();
+                    let id = sources::cf_project_id(&sources::parse_cf(&url).unwrap())?;
+                    if id != expected {
+                        return Err(format!("{slug}: expected {expected}, got {id}"));
+                    }
+                    println!("{slug}: resolved project {id}, fallback took {:.1}s", started.elapsed().as_secs_f32());
+                }
+                Ok(())
+            };
+            *worker_result.lock().unwrap() = Some(check());
+        });
+        let observed = result.clone();
+        let options = eframe::NativeOptions {
+            event_loop_builder: Some(Box::new(|builder| {
+                use winit::platform::x11::EventLoopBuilderExtX11;
+                builder.with_x11().with_any_thread(true);
+            })),
+            viewport: egui::ViewportBuilder::default().with_visible(false),
+            ..Default::default()
+        };
+        eframe::run_native(
+            "Octo project lookup check",
+            options,
+            Box::new(|_| Ok(Box::new(Probe { active: vec![], context: None, result, started: Instant::now() }))),
+        )
+        .unwrap();
+        worker.join().unwrap();
+        observed.lock().unwrap().take().unwrap().unwrap();
+    }
 
     /// Tests background search and verifies that Linux uses an offscreen surface.
     /// cargo test background_curseforge_search -- --ignored --nocapture --test-threads=1
