@@ -38,16 +38,12 @@ enum Output {
 struct ProjectRequest {
     url: String,
     out: mpsc::SyncSender<Result<u64, String>>,
-    deadline: Instant,
 }
 
 static PROJECTS: Mutex<VecDeque<ProjectRequest>> = Mutex::new(VecDeque::new());
 thread_local! {
     static CONTEXT: RefCell<Option<Rc<RefCell<WebContext>>>> = const { RefCell::new(None) };
 }
-// Automatic browser verification can take over a minute before the page loads.
-const PAGE_TIMEOUT: Duration = Duration::from_secs(150);
-const PROJECT_TIMEOUT: Duration = Duration::from_secs(170);
 
 /// Called by install workers; the app loads the page on its UI thread.
 pub fn project_id(url: &str) -> Result<u64, String> {
@@ -56,15 +52,13 @@ pub fn project_id(url: &str) -> Result<u64, String> {
         return Err("Couldn't read the CurseForge link. Paste the project's CurseForge page link and try again.".into());
     }
     let (out, result) = mpsc::sync_channel(1);
-    PROJECTS.lock().unwrap().push_back(ProjectRequest { url: url.into(), out, deadline: Instant::now() + PROJECT_TIMEOUT });
-    result.recv_timeout(PROJECT_TIMEOUT).map_err(|_| "Couldn't load the CurseForge project page. Try adding the link again.")?
+    PROJECTS.lock().unwrap().push_back(ProjectRequest { url: url.into(), out });
+    result.recv().map_err(|_| "Couldn't load the CurseForge project page. Try adding the link again.")?
 }
 
 pub fn poll_projects(active: &mut Vec<Search>, frame: &eframe::Frame) {
     for request in PROJECTS.lock().unwrap().drain(..) {
-        if request.deadline > Instant::now() {
-            active.push(Search::project(request));
-        }
+        active.push(Search::project(request));
     }
     active.retain_mut(|lookup| !lookup.poll(frame));
 }
@@ -78,7 +72,6 @@ pub struct Search {
     url: String,
     out: Option<Output>,
     snapshot: Arc<Mutex<Option<String>>>,
-    started: Instant,
     last_read: Instant,
     reading: bool,
 }
@@ -136,6 +129,52 @@ fn parse_project_snapshot(raw: &str, expected: &str) -> Result<Option<u64>, Stri
     Ok(Some(id))
 }
 
+// Results come from the server-rendered page, so skip ads, trackers and media like PyramidLauncher does.
+// Cloudflare's verification stays reachable.
+#[cfg(target_os = "linux")]
+const BLOCK_RULES: &str = r#"[
+    {"trigger":{"url-filter":".*","load-type":["third-party"]},"action":{"type":"block"}},
+    {"trigger":{"url-filter":".*","resource-type":["script","image","media","font"]},"action":{"type":"block"}},
+    {"trigger":{"url-filter":"^https?://challenges\\.cloudflare\\.com/"},"action":{"type":"ignore-previous-rules"}},
+    {"trigger":{"url-filter":"/cdn-cgi/"},"action":{"type":"ignore-previous-rules"}}
+]"#;
+
+/// Compiles the block list (async in WebKit), then loads the page. Loads unfiltered if compiling fails.
+#[cfg(target_os = "linux")]
+fn load_filtered(view: &webkit2gtk::WebView, url: &str) {
+    use webkit2gtk::glib::translate::ToGlibPtr;
+    use webkit2gtk::{WebViewExt, ffi, gio, glib};
+    unsafe extern "C" fn saved(store: *mut glib::gobject_ffi::GObject, result: *mut gio::ffi::GAsyncResult, data: glib::ffi::gpointer) {
+        unsafe {
+            let (view, url) = *Box::from_raw(data as *mut (webkit2gtk::WebView, String));
+            let filter = ffi::webkit_user_content_filter_store_save_finish(store as _, result, std::ptr::null_mut());
+            if !filter.is_null() {
+                if let Some(manager) = view.user_content_manager() {
+                    ffi::webkit_user_content_manager_add_filter(manager.to_glib_none().0, filter);
+                }
+                ffi::webkit_user_content_filter_unref(filter);
+            }
+            view.load_uri(&url);
+            glib::gobject_ffi::g_object_unref(store);
+        }
+    }
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(data_dir().join("browser-filters").as_os_str().as_bytes()).unwrap_or_default();
+    unsafe {
+        let store = ffi::webkit_user_content_filter_store_new(path.as_ptr());
+        let rules = glib::Bytes::from_static(BLOCK_RULES.as_bytes());
+        let data = Box::into_raw(Box::new((view.clone(), url.to_string())));
+        ffi::webkit_user_content_filter_store_save(
+            store,
+            c"octo-blocker".as_ptr(),
+            rules.to_glib_none().0,
+            std::ptr::null_mut(),
+            Some(saved),
+            data as _,
+        );
+    }
+}
+
 impl Search {
     pub fn new(query: &str, class: &'static str, mc: Option<&str>, flavor: Option<Flavor>, out: Results) -> Self {
         Self::page(sources::cf_search_url(query, class, mc, flavor), Output::Search { class, results: out })
@@ -154,7 +193,6 @@ impl Search {
             url,
             out: Some(out),
             snapshot: Default::default(),
-            started: Instant::now(),
             last_read: Instant::now(),
             reading: false,
         }
@@ -211,6 +249,12 @@ impl Search {
             use gtk::prelude::*;
             self.offscreen.as_ref().unwrap().show_all();
         }
+        #[cfg(target_os = "linux")]
+        {
+            use wry::WebViewExtUnix;
+            load_filtered(&view.webview(), &self.url);
+        }
+        #[cfg(not(target_os = "linux"))]
         view.load_url(&self.url).map_err(s)?;
         self.view = Some(view);
         Ok(())
@@ -269,15 +313,10 @@ impl Search {
                 },
             }
         }
-        if self.started.elapsed() > PAGE_TIMEOUT {
-            self.fail(
-                "CurseForge didn't finish loading in the background browser. It may be asking for browser verification. Try again later."
-                    .into(),
-            );
-            return true;
-        }
         // Read as soon as the DOM contains the ID; ads can delay the page's load event.
-        if !self.reading && self.last_read.elapsed() > Duration::from_millis(500) {
+        // WebKit drops the callback when the page navigates mid-read, so retry a read that never answered.
+        let wait = if self.reading { Duration::from_secs(3) } else { Duration::from_millis(500) };
+        if self.last_read.elapsed() > wait {
             let out = self.snapshot.clone();
             self.reading = true;
             self.last_read = Instant::now();
@@ -334,11 +373,7 @@ mod tests {
     #[test]
     fn closing_a_project_lookup_unblocks_the_worker() {
         let (out, result) = mpsc::sync_channel(1);
-        let lookup = Search::project(ProjectRequest {
-            url: "https://www.curseforge.com/minecraft/mc-mods/ferritecore".into(),
-            out,
-            deadline: Instant::now() + Duration::from_secs(60),
-        });
+        let lookup = Search::project(ProjectRequest { url: "https://www.curseforge.com/minecraft/mc-mods/ferritecore".into(), out });
         drop(lookup);
         assert!(result.try_recv().unwrap().unwrap_err().contains("cancelled"));
     }
@@ -459,6 +494,7 @@ mod live {
             search: Option<Search>,
             results: Results,
             step: usize,
+            started: Instant,
             failure: Arc<Mutex<Option<String>>>,
         }
         impl eframe::App for Probe {
@@ -471,6 +507,7 @@ mod live {
                 }
                 if self.search.is_none() {
                     self.results = Default::default();
+                    self.started = Instant::now();
                     self.search = Some(match self.step {
                         0 => Search::new("jei", "mc-mods", Some("1.20.1"), Some(Flavor::Forge), self.results.clone()),
                         1 => Search::new("all the mods", "modpacks", None, None, self.results.clone()),
@@ -484,6 +521,7 @@ mod live {
                 }
                 if done {
                     let result = self.results.lock().unwrap().take().unwrap();
+                    println!("Search {}: took {:.1}s", self.step, self.started.elapsed().as_secs_f32());
                     match result {
                         Ok(hits) if self.step == 2 && hits.is_empty() => {
                             println!("Search 2: no results, as expected");
@@ -521,7 +559,7 @@ mod live {
         eframe::run_native(
             "Octo background browser check",
             options,
-            Box::new(|_| Ok(Box::new(Probe { search: None, results: Default::default(), step: 0, failure }))),
+            Box::new(|_| Ok(Box::new(Probe { search: None, results: Default::default(), step: 0, started: Instant::now(), failure }))),
         )
         .unwrap();
         let failure = observed.lock().unwrap().clone();

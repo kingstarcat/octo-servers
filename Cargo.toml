@@ -31,5 +31,5 @@ windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18.2"
 libloading = "0.7"
-webkit2gtk = "=2.0.2"
+webkit2gtk = { version = "=2.0.2", features = ["v2_24"] }
 winit = "0.30.13"
