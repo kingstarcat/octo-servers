@@ -118,7 +118,15 @@ pub fn header(ui: &mut egui::Ui, srv: &mut Server) {
     });
 }
 
-pub fn dashboard(ui: &mut egui::Ui, srv: &mut Server, ip: &str, playit: &crate::playit::Playit, busy: bool, tab: &mut Tab) -> Option<Act> {
+pub fn dashboard(
+    ui: &mut egui::Ui,
+    srv: &mut Server,
+    ip: &str,
+    playit: &crate::playit::Playit,
+    busy: bool,
+    tab: &mut Tab,
+    webhook: &str,
+) -> Option<Act> {
     use crate::playit::Tunnel;
     let tunnel = if playit.running() { playit.tunnel.lock().unwrap().clone() } else { Tunnel::Off };
     // while linking, the playit log holds the approval link
@@ -152,11 +160,17 @@ pub fn dashboard(ui: &mut egui::Ui, srv: &mut Server, ip: &str, playit: &crate::
                                 open_folder(&reports);
                             }
                             let sent = srv.sent.lock().unwrap().clone();
-                            if let Some(url) = crate::server::CRASH_WEBHOOK
+                            let own = webhook.trim();
+                            let target = if crate::server::is_webhook(own) {
+                                Some((own, "Send crash log"))
+                            } else {
+                                crate::server::CRASH_WEBHOOK.map(|u| (u, "Send to Aaron"))
+                            };
+                            if let Some((url, label)) = target
                                 && (sent.is_empty() || sent.starts_with("Couldn't"))
-                                && ui.small_button("Send to Aaron").clicked()
+                                && ui.small_button(label).clicked()
                             {
-                                srv.send_crash(url);
+                                srv.send_crash(url.to_string());
                             }
                         });
                         let sent = srv.sent.lock().unwrap().clone();

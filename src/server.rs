@@ -184,7 +184,7 @@ impl Server {
     }
 
     /// Posts this run's console plus a recent crash report to the webhook, in the background.
-    pub fn send_crash(&self, url: &'static str) {
+    pub fn send_crash(&self, url: String) {
         *self.sent.lock().unwrap() = "Sending...".into();
         let lines = self.console.lock().unwrap().clone();
         let start = lines.iter().rposition(|l| l.starts_with("[octo]") && l.contains(" -Xmx")).unwrap_or(0);
@@ -214,8 +214,8 @@ impl Server {
         let msg: String = msg.chars().take(1900).collect();
         let sent = self.sent.clone();
         std::thread::spawn(move || {
-            *sent.lock().unwrap() = match post_files(url, &msg, &files) {
-                Ok(()) => "Sent to Aaron.".into(),
+            *sent.lock().unwrap() = match post_files(&url, &msg, &files) {
+                Ok(()) => "Crash log sent.".into(),
                 Err(e) => format!("Couldn't send the log ({e}). Check the internet connection and try again."),
             };
         });
@@ -251,6 +251,18 @@ impl Server {
         }
         let _ = c.kill();
     }
+}
+
+/// A Discord webhook link (the post format below is Discord's).
+pub fn is_webhook(url: &str) -> bool {
+    [
+        "https://discord.com/api/webhooks/",
+        "https://discordapp.com/api/webhooks/",
+        "https://ptb.discord.com/api/webhooks/",
+        "https://canary.discord.com/api/webhooks/",
+    ]
+    .iter()
+    .any(|p| url.strip_prefix(p).is_some_and(|rest| rest.contains('/')))
 }
 
 /// Discord webhook post with text file attachments (multipart; ureq has no builder for it).
@@ -532,6 +544,15 @@ pub fn ram_warning(ram_mb: u32) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn webhook_links() {
+        assert!(super::is_webhook("https://discord.com/api/webhooks/123/abc"));
+        assert!(super::is_webhook("https://discordapp.com/api/webhooks/123/abc"));
+        assert!(!super::is_webhook("https://discord.com/api/webhooks/"));
+        assert!(!super::is_webhook("https://example.com/api/webhooks/123/abc"));
+        assert!(!super::is_webhook(""));
+    }
+
     #[test]
     fn whitelist_turned_off() {
         let text = "#Minecraft server properties\nmotd=GTNH\nwhite-list=true\nmax-players=10\n";

@@ -194,11 +194,13 @@ pub fn download_all(jobs: Vec<Job>, log: &Log) -> Vec<String> {
 struct Settings {
     parallel_downloads: usize,
     backup_on_start: bool,
+    /// The user's own Discord webhook for crash logs; empty means the built-in one (if any).
+    crash_webhook: String,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { parallel_downloads: 4, backup_on_start: true }
+        Settings { parallel_downloads: 4, backup_on_start: true, crash_webhook: String::new() }
     }
 }
 
@@ -888,7 +890,7 @@ impl eframe::App for App {
             ui.separator();
             ui.add_space(4.0);
             let act = match self.tab {
-                Tab::Dashboard => dashboard::dashboard(ui, srv, &self.ip, &self.playit, busy, &mut self.tab),
+                Tab::Dashboard => dashboard::dashboard(ui, srv, &self.ip, &self.playit, busy, &mut self.tab, &self.settings.crash_webhook),
                 Tab::Players => {
                     dashboard::players(ui, srv, &mut self.player_name);
                     None
@@ -1675,6 +1677,25 @@ impl App {
                 saved = self.settings.save();
             }
             ui.weak("Keeps the last 5 automatic backups in each server's backups folder.");
+            ui.separator();
+            ui.label("Discord webhook for crash logs");
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut self.settings.crash_webhook)
+                    .hint_text("https://discord.com/api/webhooks/...")
+                    .desired_width(360.0),
+            );
+            if r.changed() {
+                saved = self.settings.save();
+            }
+            let hook = self.settings.crash_webhook.trim();
+            if !hook.is_empty() && !server::is_webhook(hook) {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    "That isn't a Discord webhook link. Copy it from Server Settings, Integrations, Webhooks.",
+                );
+            } else {
+                ui.weak("When a server crashes, a button sends its log to this channel.");
+            }
         });
         self.show_settings = open;
         if let Err(e) = saved {
