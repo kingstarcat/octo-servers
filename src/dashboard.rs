@@ -160,17 +160,11 @@ pub fn dashboard(
                                 open_folder(&reports);
                             }
                             let sent = srv.sent.lock().unwrap().clone();
-                            let own = webhook.trim();
-                            let target = if crate::server::is_webhook(own) {
-                                Some((own, "Send crash log"))
-                            } else {
-                                crate::server::CRASH_WEBHOOK.map(|u| (u, "Send to Aaron"))
-                            };
-                            if let Some((url, label)) = target
+                            if crate::server::is_webhook(webhook.trim())
                                 && (sent.is_empty() || sent.starts_with("Couldn't"))
-                                && ui.small_button(label).clicked()
+                                && ui.small_button("Send crash log").clicked()
                             {
-                                srv.send_crash(url.to_string());
+                                srv.send_crash(webhook.trim().to_string());
                             }
                         });
                         let sent = srv.sent.lock().unwrap().clone();

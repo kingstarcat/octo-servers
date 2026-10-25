@@ -360,15 +360,14 @@ fn hits(ui: &mut egui::Ui, id: &str, results: &Results, button: &str, enabled: b
         }
         Some(Ok(v)) => {
             for h in v {
+                let mut use_rect = egui::Rect::NOTHING;
                 let row = ui.horizontal(|ui| {
                     if !h.icon_url.is_empty() {
                         ui.add(egui::Image::new(&h.icon_url).fit_to_exact_size(egui::vec2(40.0, 40.0)).corner_radius(6.0));
                     }
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
-                            if ui.add_enabled(enabled, egui::Button::new(button)).clicked() {
-                                picked = Some(Pick::Use(h.slug.clone()));
-                            }
+                            use_rect = ui.add_enabled(enabled, egui::Button::new(button)).rect;
                             ui.strong(&h.title);
                             // Technic and ATLauncher don't report download counts
                             if h.downloads > 0 {
@@ -378,7 +377,11 @@ fn hits(ui: &mut egui::Ui, id: &str, results: &Results, button: &str, enabled: b
                         ui.weak(&h.description);
                     });
                 });
+                // the row's double-click sense sits on top of the button, so a click on the button lands here
                 let r = ui.interact(row.response.rect, ui.id().with(("hit", &h.slug)), egui::Sense::click());
+                if enabled && r.clicked() && r.hover_pos().is_some_and(|p| use_rect.contains(p)) {
+                    picked = Some(Pick::Use(h.slug.clone()));
+                }
                 if r.double_clicked() {
                     picked = Some(Pick::Open(h.slug.clone()));
                 }
@@ -572,6 +575,13 @@ impl App {
         };
         PARALLEL.store(app.settings.parallel_downloads, Ordering::Relaxed);
         app.reload();
+        // 0.3.6 and 0.3.7 had a webhook built in; keep it in settings when updating from them
+        if app.settings.crash_webhook.is_empty()
+            && let Some(url) = update::old_webhook()
+        {
+            app.settings.crash_webhook = url;
+            let _ = app.settings.save();
+        }
         update::cleanup();
         let slot = app.update.clone();
         // quiet on failure: no network or no release yet just means no banner
@@ -1232,8 +1242,7 @@ impl App {
                                         } else {
                                             format!("https://modrinth.com/modpack/{slug}")
                                         };
-                                        let name = slug.rsplit('/').next().unwrap_or(&slug);
-                                        use_pack(d, link, name);
+                                        use_pack(d, link);
                                     }
                                     Some(Pick::Open(slug)) => open_page = Some(slug),
                                     None => {}
@@ -1382,13 +1391,10 @@ impl App {
     }
 }
 
-fn use_pack(d: &mut NewDialog, link: String, slug: &str) {
+fn use_pack(d: &mut NewDialog, link: String) {
     d.link = link;
     if !d.src.is_pack() {
         d.src = Source::Pack;
-    }
-    if d.name.is_empty() {
-        d.name = slug.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').take(40).collect();
     }
 }
 
@@ -1477,7 +1483,7 @@ impl App {
         match (action, target) {
             (Some(project::Action::UsePack(link)), _) => {
                 let d = self.new.get_or_insert_with(NewDialog::new);
-                use_pack(d, link, &slug);
+                use_pack(d, link);
                 self.page = None;
             }
             (Some(project::Action::Install(version)), project::Target::Server { dir, mc, flavor }) => {
@@ -1830,6 +1836,56 @@ mod tests {
         assert_eq!(url_file_name("https://x/files/1/2/All%20the%20Mods%209-1.1.1.zip?api-key=1"), "All the Mods 9-1.1.1.zip");
         assert_eq!(url_file_name("https://x/a%2F..%2Fb.jar"), "a_.._b.jar");
         assert_eq!(url_file_name("https://x/"), "file");
+    }
+
+    /// Use on a search result row fills in the pack link (the row's double-click area covers the button).
+    /// cargo test result_row_clicks -- --ignored
+    #[test]
+    #[ignore]
+    fn result_row_clicks() {
+        let data = std::env::temp_dir().join(format!("octo-rows-{}", std::process::id()));
+        std::fs::create_dir_all(data.join("servers")).unwrap();
+        unsafe { std::env::set_var("OCTO_DATA_DIR", &data) };
+        let pack = "https://www.curseforge.com/minecraft/modpacks/all-the-mods-10";
+        for (src, slug, link) in [
+            (Source::Modrinth, "fabulously-optimized", "https://modrinth.com/modpack/fabulously-optimized"),
+            (Source::CurseForge, pack, pack),
+        ] {
+            let ctx = egui::Context::default();
+            let run = |app: &mut App, events: Vec<egui::Event>| {
+                let screen = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0)));
+                let input = egui::RawInput { screen_rect: screen, events, ..Default::default() };
+                let mut o = ctx.run_ui(input, |ui| eframe::App::ui(app, ui, &mut eframe::Frame::_new_kittest()));
+                o.textures_delta.clear();
+                o.shapes.iter().find_map(|s| match &s.shape {
+                    egui::Shape::Text(t) if ["Use", "Pack"].contains(&t.galley.text()) => {
+                        Some((t.galley.text().to_string(), t.pos + t.galley.rect.center().to_vec2()))
+                    }
+                    _ => None,
+                })
+            };
+            let click = |app: &mut App, p: egui::Pos2| {
+                let press = |pressed| egui::Event::PointerButton {
+                    pos: p,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                };
+                run(app, vec![egui::Event::PointerMoved(p)]);
+                run(app, vec![press(true)]);
+                run(app, vec![press(false)]);
+            };
+            let mut app = App::new();
+            let mut d = NewDialog::new();
+            d.src = src;
+            let hit =
+                sources::Hit { title: "Pack".into(), slug: slug.into(), description: "d".into(), downloads: 5, icon_url: String::new() };
+            d.results = Arc::new(Mutex::new(Some(Ok(vec![hit]))));
+            app.new = Some(d);
+            let (_, use_at) = (0..3).filter_map(|_| run(&mut app, vec![])).last().expect("Use button drawn");
+            click(&mut app, use_at);
+            assert_eq!(app.new.as_ref().unwrap().link, link);
+        }
     }
 
     /// Renders the whole app with a fake server on every tab (and the dialogs) to catch panics.

@@ -7,10 +7,6 @@ use std::process::Child;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Discord webhook for crash logs. Set at build time so it stays out of the public repo;
-/// without it the button is hidden.
-pub const CRASH_WEBHOOK: Option<&str> = option_env!("OCTO_CRASH_WEBHOOK");
-
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
     pub flavor: Flavor,

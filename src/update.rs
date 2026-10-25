@@ -59,6 +59,24 @@ fn install_to(r: &Release, exe: PathBuf, log: &Log) -> Result<PathBuf, String> {
     Ok(exe)
 }
 
+/// A Discord webhook built into the previous build (`octo.old`, there until `cleanup`).
+pub fn old_webhook() -> Option<String> {
+    webhook_in(&std::fs::read(std::env::current_exe().ok()?.with_extension("old")).ok()?)
+}
+
+/// First "https://discord.com/api/webhooks/<id>/<token>" in a binary. The prefix alone also
+/// appears as a plain string (link checks, hint text), so the id and token are required.
+fn webhook_in(bytes: &[u8]) -> Option<String> {
+    let pre = b"https://discord.com/api/webhooks/";
+    bytes.windows(pre.len()).enumerate().filter(|(_, w)| w == pre).find_map(|(i, _)| {
+        let rest = &bytes[i + pre.len()..];
+        let id = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+        // tokens are 68 characters; whatever string follows in the binary can continue the run
+        let token = rest.get(id + 1..)?.iter().take(68).take_while(|b| b.is_ascii_alphanumeric() || **b == b'_' || **b == b'-').count();
+        (id >= 17 && rest[id] == b'/' && token == 68).then(|| String::from_utf8_lossy(&bytes[i..i + pre.len() + id + 1 + token]).into())
+    })
+}
+
 /// Remove the previous build left behind by `install`.
 pub fn cleanup() {
     if let Ok(exe) = std::env::current_exe() {
@@ -69,6 +87,14 @@ pub fn cleanup() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn webhook_from_old_build() {
+        let url = format!("https://discord.com/api/webhooks/1497384162297122957/{}", "aB3_-".repeat(13) + "xyz");
+        let bin = format!("\0https://discord.com/api/webhooks/https://discordapp.com/api/webhooks/x{url}Send crash log\0");
+        assert_eq!(webhook_in(bin.as_bytes()), Some(url));
+        assert_eq!(webhook_in(b"https://discord.com/api/webhooks/..."), None);
+    }
 
     #[test]
     fn version_compare() {
