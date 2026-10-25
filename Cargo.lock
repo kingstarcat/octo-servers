@@ -3062,7 +3062,7 @@ dependencies = [
 
 [[package]]
 name = "octo-servers"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "dirs 7.0.0",
  "eframe",

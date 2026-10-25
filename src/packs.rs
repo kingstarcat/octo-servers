@@ -254,7 +254,7 @@ fn finish_downloads(failed: Vec<String>) -> Result<(), String> {
     ))
 }
 
-/// Modrinth .mrpack: download server-side files, apply overrides.
+/// Modrinth .mrpack: download server-side files, apply overrides, set client-only mods aside.
 fn mrpack(dir: &Path, log: &Log) -> Result<Detected, String> {
     let idx: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("modrinth.index.json")).map_err(s)?).map_err(s)?;
     let deps = &idx["dependencies"];
@@ -286,6 +286,10 @@ fn mrpack(dir: &Path, log: &Log) -> Result<Detected, String> {
     }
     let _ = std::fs::remove_dir_all(dir.join("client-overrides"));
     let _ = std::fs::remove_file(dir.join("modrinth.index.json"));
+    // packs mark client mods server "required" and ship jars in overrides/mods, so check them all
+    if dir.join("mods").is_dir() {
+        crate::worlds::clean_mods(dir, &Default::default(), log)?;
+    }
     Ok((flavor, mc, loader))
 }
 

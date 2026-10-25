@@ -151,7 +151,18 @@ pub fn dashboard(ui: &mut egui::Ui, srv: &mut Server, ip: &str, playit: &crate::
                             if reports.is_dir() && ui.small_button("Crash reports").clicked() {
                                 open_folder(&reports);
                             }
+                            let sent = srv.sent.lock().unwrap().clone();
+                            if let Some(url) = crate::server::CRASH_WEBHOOK
+                                && (sent.is_empty() || sent.starts_with("Couldn't"))
+                                && ui.small_button("Send to Aaron").clicked()
+                            {
+                                srv.send_crash(url);
+                            }
                         });
+                        let sent = srv.sent.lock().unwrap().clone();
+                        if !sent.is_empty() {
+                            ui.weak(sent);
+                        }
                     });
                 }
                 ui.weak(srv.uptime().map_or("Not running".into(), |d| format!("Up for {}", hms(d))));

@@ -356,8 +356,17 @@ fn mod_ids(jar: &Path) -> Vec<String> {
         .iter()
         .filter_map(|n| text(n))
         .flat_map(|t| {
+            // only [[mods]] entries; [[dependencies.x]] list modId = "forge", "minecraft", ...
+            let mut in_mods = false;
             t.lines()
                 .filter_map(|l| {
+                    let code = l.split('#').next().unwrap_or("").replace(' ', "");
+                    if code.starts_with('[') {
+                        in_mods = code.trim() == "[[mods]]";
+                    }
+                    if !in_mods {
+                        return None;
+                    }
                     l.trim()
                         .strip_prefix("modId")?
                         .trim_start()
@@ -731,11 +740,13 @@ mod tests {
         let (mods, aside) = (d.join("mods"), d.join(CLIENT_ONLY));
         std::fs::create_dir_all(&mods).unwrap();
         std::fs::create_dir_all(&aside).unwrap();
-        jar(&mods.join("create.jar"), "META-INF/mods.toml", "[[mods]]\nmodId=\"create\"\n");
+        jar(&mods.join("create.jar"), "META-INF/mods.toml", "[[mods]] #mandatory\r\nmodId=\"create\"\n");
         jar(&mods.join("trepu.jar"), "META-INF/neoforge.mods.toml", "[[mods]]\nmodId = 'tensura_trepu' # ui\n");
         jar(&mods.join("hud.jar"), "com/hud/client/Overlay.class", "");
         jar(&mods.join("sodium.jar"), "net/caffeinemc/mods/sodium/client/compatibility/checks/PreLaunchChecks.class", "");
-        jar(&aside.join("athena.jar"), "META-INF/mods.toml", "modId=\"athena\"\n");
+        jar(&aside.join("athena.jar"), "META-INF/mods.toml", "[[mods]]\nmodId=\"athena\"\n");
+        // a set-aside mod's own dependencies aren't its ids (Isle of Berk's torohealth kept coming back)
+        jar(&aside.join("toro.jar"), "META-INF/mods.toml", "[[mods]]\nmodId=\"toro\"\n[[dependencies.toro]]\n  modId=\"forge\"\n");
         jar(&aside.join("iris.jar"), "fabric.mod.json", r#"{"id":"iris"}"#);
         let l = |s: &str| s.lines().map(String::from).collect::<Vec<_>>();
         let neo = l(
@@ -762,6 +773,7 @@ mod tests {
         let neo_dep = l("Mod create requires athena 4.0 or above\nCurrently, athena is not installed");
         assert_eq!(missing_deps(&neo_dep, &aside), [aside.join("athena.jar")]);
         assert!(missing_deps(&l("Mod create requires athenaplus 1.0"), &aside).is_empty(), "whole ids only");
+        assert!(missing_deps(&l("Mod create requires forge 40"), &aside).is_empty(), "dependency ids");
         std::fs::remove_dir_all(&d).unwrap();
     }
 

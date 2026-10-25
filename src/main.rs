@@ -1606,7 +1606,8 @@ impl App {
         let Some((name, ram, src, over, server_only)) = self.pack_job.clone() else { return };
         (self.pack_clean, self.retry_pack) = (clean, false);
         self.run_task(format!("Importing {name}"), move |log| {
-            server::create_with(&name, ram, log, |dir, log| packs::import(&src, dir, over, clean, server_only, log))
+            server::create_with(&name, ram, log, |dir, log| packs::import(&src, dir, over, clean, server_only, log))?;
+            worlds::test_start(&server::servers_dir().join(&name), log)
         });
     }
 

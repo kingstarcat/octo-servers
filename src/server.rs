@@ -4,7 +4,12 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Child;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// Discord webhook for crash logs. Set at build time so it stays out of the public repo;
+/// without it the button is hidden.
+pub const CRASH_WEBHOOK: Option<&str> = option_env!("OCTO_CRASH_WEBHOOK");
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
@@ -26,6 +31,8 @@ pub struct Server {
     pub restart: bool,
     /// Why the server stopped on its own (not via Stop / "stop"), for the dashboard.
     pub crash: Option<String>,
+    /// "Send to Aaron" progress for the current crash; empty until clicked.
+    pub sent: Arc<Mutex<String>>,
     user_stopped: bool,
     child: Option<Child>,
     started: Option<Instant>,
@@ -58,7 +65,18 @@ pub fn load_all() -> Vec<Server> {
 pub fn load(dir: PathBuf) -> Option<Server> {
     let cfg = serde_json::from_str(&std::fs::read_to_string(dir.join("octo.json")).ok()?).ok()?;
     let name = dir.file_name()?.to_string_lossy().into();
-    Some(Server { name, dir, cfg, console: Log::default(), restart: false, crash: None, user_stopped: false, child: None, started: None })
+    Some(Server {
+        name,
+        dir,
+        cfg,
+        console: Log::default(),
+        restart: false,
+        crash: None,
+        sent: Default::default(),
+        user_stopped: false,
+        child: None,
+        started: None,
+    })
 }
 
 pub fn create(name: &str, cfg: Config, log: &Log) -> Result<(), String> {
@@ -160,8 +178,47 @@ impl Server {
         self.child = Some(spawn_logged(c, &self.console)?);
         self.started = Some(Instant::now());
         self.crash = None;
+        self.sent.lock().unwrap().clear();
         self.user_stopped = false;
         Ok(())
+    }
+
+    /// Posts this run's console plus a recent crash report to the webhook, in the background.
+    pub fn send_crash(&self, url: &'static str) {
+        *self.sent.lock().unwrap() = "Sending...".into();
+        let lines = self.console.lock().unwrap().clone();
+        let start = lines.iter().rposition(|l| l.starts_with("[octo]") && l.contains(" -Xmx")).unwrap_or(0);
+        let mut files = vec![("console.txt".to_string(), lines[start..].join("\n"))];
+        let report = std::fs::read_dir(self.dir.join("crash-reports"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+            .filter(|(t, _)| t.elapsed().is_ok_and(|d| d < Duration::from_secs(3600)))
+            .max();
+        if let Some((_, p)) = report
+            && let Ok(text) = std::fs::read_to_string(&p)
+        {
+            files.push((p.file_name().unwrap().to_string_lossy().into(), text));
+        }
+        let msg = format!(
+            "**{}** crashed ({:?} {}, Java {}, Octo {} on {})\n{}",
+            self.name,
+            self.cfg.flavor,
+            self.cfg.mc_version,
+            self.cfg.java_major,
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            self.crash.as_deref().unwrap_or("")
+        );
+        let msg: String = msg.chars().take(1900).collect();
+        let sent = self.sent.clone();
+        std::thread::spawn(move || {
+            *sent.lock().unwrap() = match post_files(url, &msg, &files) {
+                Ok(()) => "Sent to Aaron.".into(),
+                Err(e) => format!("Couldn't send the log ({e}). Check the internet connection and try again."),
+            };
+        });
     }
 
     pub fn uptime(&self) -> Option<Duration> {
@@ -194,6 +251,23 @@ impl Server {
         }
         let _ = c.kill();
     }
+}
+
+/// Discord webhook post with text file attachments (multipart; ureq has no builder for it).
+fn post_files(url: &str, msg: &str, files: &[(String, String)]) -> Result<(), String> {
+    let b = "octo-7f3a9c2e1d";
+    // allowed_mentions: a log line with @everyone shouldn't ping anyone
+    let payload = serde_json::json!({"content": msg, "allowed_mentions": {"parse": []}});
+    let mut body =
+        format!("--{b}\r\nContent-Disposition: form-data; name=\"payload_json\"\r\nContent-Type: application/json\r\n\r\n{payload}\r\n");
+    for (i, (name, text)) in files.iter().enumerate() {
+        body += &format!(
+            "--{b}\r\nContent-Disposition: form-data; name=\"files[{i}]\"; filename=\"{name}\"\r\nContent-Type: text/plain\r\n\r\n{text}\r\n"
+        );
+    }
+    body += &format!("--{b}--\r\n");
+    ureq::post(url).header("Content-Type", format!("multipart/form-data; boundary={b}")).send(body).map_err(s)?;
+    Ok(())
 }
 
 /// Plain-language reason for a crash, from the console output.
@@ -635,6 +709,7 @@ mod tests {
             console: Log::default(),
             restart: false,
             crash: None,
+            sent: Default::default(),
             user_stopped: false,
             child: None,
             started: None,
